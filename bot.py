@@ -83,3 +83,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+print(
+    "DEBUG TELEGRAM TOKEN:",
+    "empty=" + str(TELEGRAM_TOKEN in [None, ""]),
+    "len=" + str(len(TELEGRAM_TOKEN or "")),
+    "has_colon=" + str(":" in (TELEGRAM_TOKEN or "")),
+)
