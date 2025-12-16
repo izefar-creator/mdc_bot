@@ -1,9 +1,14 @@
 import os
+import io
 import asyncio
+import smtplib
 from datetime import datetime
+from email.mime.text import MIMEText
+from typing import Dict, Optional
+
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -14,26 +19,23 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# =========================================================
-# Maison de Café — Telegram Bot (Render + GitHub + OpenAI Assistant)
-#
-# Что нужно в Render → Environment:
-# 1) TELEGRAM_BOT_TOKEN   — токен из BotFather
-# 2) OPENAI_API_KEY       — ключ OpenAI
-# 3) ASSISTANT_ID         — ID ассистента OpenAI (где System Instructions + Files/Search + VectorStore)
-# 4) OWNER_TELEGRAM_ID    — твой Telegram user id (чтобы бот присылал лиды владельцу)
-#
-# По умолчанию бот стартует на украинском языке.
-# Меню и приветствие Макса — украинские.
-# =========================================================
-
-# ====== ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ======
+# =========================
+# ENV
+# =========================
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
-OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID")  # можно не задавать, но лиды владельцу тогда не отправятся
+
+OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID")  # обязательный для уведомлений владельцу
+LEAD_EMAIL_TO = os.getenv("LEAD_EMAIL_TO", "maisondecafe.coffee@gmail.com")
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = os.getenv("SMTP_PORT")
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
@@ -44,366 +46,548 @@ if not ASSISTANT_ID:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =========================================================
-# Хранилища состояния (в памяти процесса)
-# =========================================================
+# =========================
+# STATE (IN-MEMORY)
+# =========================
+user_threads: Dict[str, str] = {}   # user_id -> thread_id
+user_lang: Dict[str, str] = {}      # user_id -> lang (ua/ru/en/fr/nl)
 
-# У каждого пользователя — свой thread OpenAI Assistant
-user_threads: dict[str, str] = {}
+lead_states: Dict[str, str] = {}    # user_id -> step: name/phone/email/message
+lead_data: Dict[str, Dict[str, str]] = {}  # user_id -> collected fields
 
-# Выбранный язык пользователя (по умолчанию украинский)
-# "uk", "ru", "en", "fr", "nl"
-user_lang: dict[str, str] = {}
+# =========================
+# I18N (texts + buttons)
+# =========================
+LANGS = ["ua", "ru", "en", "fr", "nl"]
 
-# Простая FSM для формы лида
-# lead_state[user_id] = {"step": int, "data": {...}}
-lead_state: dict[str, dict] = {}
+LANG_LABELS = {
+    "ua": "🇺🇦 Українська",
+    "ru": "🇷🇺 Русский",
+    "en": "🇬🇧 English",
+    "fr": "🇫🇷 Français",
+    "nl": "🇳🇱 Nederlands",
+}
 
-# =========================================================
-# Константы: контакты Maison de Café
-# =========================================================
-CONTACT_EMAIL = "maisondecafe.coffee@gmail.com"
-CONTACT_PHONE = "+32 470 600 806"
-TELEGRAM_CHANNEL = "https://t.me/maisondecafe"
+# Главное меню (кнопки) — локализовано
+MENU = {
+    "ua": {
+        "what": "☕ Що таке Maison de Café?",
+        "price": "💶 Скільки коштує відкрити кав’ярню?",
+        "payback": "📈 Окупність і прибуток",
+        "franchise": "🤝 Умови франшизи",
+        "contacts": "📞 Контакти / зв’язок з власником",
+        "lead": "📝 Залишити заявку",
+        "lang": "🌍 Мова / Language",
+    },
+    "ru": {
+        "what": "☕ Что такое Maison de Café?",
+        "price": "💶 Сколько стоит открыть кофейню?",
+        "payback": "📈 Окупаемость и прибыль",
+        "franchise": "🤝 Условия франшизы",
+        "contacts": "📞 Контакты / связь с владельцем",
+        "lead": "📝 Оставить заявку",
+        "lang": "🌍 Язык / Language",
+    },
+    "en": {
+        "what": "☕ What is Maison de Café?",
+        "price": "💶 How much does it cost to open a coffee point?",
+        "payback": "📈 Payback & profit",
+        "franchise": "🤝 Franchise terms",
+        "contacts": "📞 Contacts / owner",
+        "lead": "📝 Leave a request",
+        "lang": "🌍 Language",
+    },
+    "fr": {
+        "what": "☕ Qu’est-ce que Maison de Café ?",
+        "price": "💶 Combien coûte l’ouverture ?",
+        "payback": "📈 Rentabilité & profit",
+        "franchise": "🤝 Conditions de franchise",
+        "contacts": "📞 Contacts / propriétaire",
+        "lead": "📝 Laisser une demande",
+        "lang": "🌍 Langue / Language",
+    },
+    "nl": {
+        "what": "☕ Wat is Maison de Café?",
+        "price": "💶 Wat kost het om te starten?",
+        "payback": "📈 Terugverdientijd & winst",
+        "franchise": "🤝 Franchisevoorwaarden",
+        "contacts": "📞 Contact / eigenaar",
+        "lead": "📝 Aanvraag achterlaten",
+        "lang": "🌍 Taal / Language",
+    },
+}
 
-# =========================================================
-# Кнопки: главное меню (UA)
-# =========================================================
-MAIN_KEYBOARD_UA = ReplyKeyboardMarkup(
-    [
-        ["☕ Що таке Maison de Café?", "💶 Скільки коштує відкрити кав’ярню?"],
-        ["📈 Окупність і прибуток", "🤝 Умови франшизи"],
-        ["📞 Контакти / зв’язок з власником", "📝 Залишити заявку"],
-        ["🌍 Мова / Language"],
-    ],
-    resize_keyboard=True
-)
+TEXTS = {
+    "ua": {
+        "welcome": (
+            "Добрий день!\n"
+            "Мене звати Макс, я віртуальний помічник компанії Maison de Café.\n"
+            "Я допоможу вам розібратися у всіх питаннях, пов’язаних з нашими кав’ярнями самообслуговування, запуском і умовами співпраці.\n"
+            "Щоб продовжити, підкажіть, будь ласка, як вас звати?"
+        ),
+        "choose_lang": "🌍 Оберіть мову:",
+        "lang_set": "✅ Мову змінено: {lang}.",
+        "lead_start": "📝 Залишити заявку.\n\nКрок 1/4: Напишіть ваше ім’я та прізвище.",
+        "lead_phone": "Крок 2/4: Напишіть ваш номер телефону.",
+        "lead_email": "Крок 3/4: Напишіть ваш email.",
+        "lead_msg": "Крок 4/4: Коротко опишіть ваш запит (1–2 речення).",
+        "lead_done": (
+            "Дякуємо! Заявку відправлено. Наш менеджер зв’яжеться з вами протягом 24 годин.\n\n"
+            "{email_note}"
+        ),
+        "voice_fail": "Не вдалося розпізнати голос. Спробуйте ще раз.",
+        "generic_error": "⚠️ Сталася помилка. Спробуйте ще раз.",
+        "contacts_text": (
+            "Зв’язатися з Maison de Café можна так:\n\n"
+            "• Email: maisondecafe.coffee@gmail.com\n"
+            "• Телефон: +32 470 600 806\n"
+            "• Telegram-канал: https://t.me/maisondecafe\n\n"
+            "Якщо хочете — натисніть «Залишити заявку», і менеджер зв’яжеться з вами протягом 24 годин."
+        ),
+    },
+    "ru": {
+        "welcome": (
+            "Добрый день!\n"
+            "Меня зовут Макс, я виртуальный помощник компании Maison de Café.\n"
+            "Я помогу вам разобраться во всех вопросах, связанных с нашими кофейнями самообслуживания, запуском и условиями сотрудничества.\n"
+            "Чтобы продолжить, подскажите, пожалуйста, как вас зовут?"
+        ),
+        "choose_lang": "🌍 Выберите язык:",
+        "lang_set": "✅ Язык установлен: {lang}.",
+        "lead_start": "📝 Оставить заявку.\n\nШаг 1/4: Напишите ваше имя и фамилию.",
+        "lead_phone": "Шаг 2/4: Напишите ваш номер телефона.",
+        "lead_email": "Шаг 3/4: Напишите ваш email.",
+        "lead_msg": "Шаг 4/4: Коротко опишите запрос (1–2 предложения).",
+        "lead_done": (
+            "Спасибо! Заявка отправлена. Наш менеджер свяжется с вами в течение 24 часов.\n\n"
+            "{email_note}"
+        ),
+        "voice_fail": "Не удалось распознать голос. Попробуйте ещё раз.",
+        "generic_error": "⚠️ Произошла ошибка. Попробуйте ещё раз.",
+        "contacts_text": (
+            "Связаться с Maison de Café можно так:\n\n"
+            "• Email: maisondecafe.coffee@gmail.com\n"
+            "• Телефон: +32 470 600 806\n"
+            "• Telegram-канал: https://t.me/maisondecafe\n\n"
+            "Если хотите — нажмите «Оставить заявку», и менеджер свяжется с вами в течение 24 часов."
+        ),
+    },
+    "en": {
+        "welcome": (
+            "Hello!\n"
+            "My name is Max, I’m the virtual assistant of Maison de Café.\n"
+            "I’ll help you with everything related to our self-service coffee points, launch costs, and partnership terms.\n"
+            "To continue, may I know your name?"
+        ),
+        "choose_lang": "🌍 Choose a language:",
+        "lang_set": "✅ Language set: {lang}.",
+        "lead_start": "📝 Leave a request.\n\nStep 1/4: Please type your first & last name.",
+        "lead_phone": "Step 2/4: Please type your phone number.",
+        "lead_email": "Step 3/4: Please type your email.",
+        "lead_msg": "Step 4/4: Briefly describe your request (1–2 sentences).",
+        "lead_done": "Thank you! Request sent. Our manager will contact you within 24 hours.\n\n{email_note}",
+        "voice_fail": "I couldn't understand the voice message. Please try again.",
+        "generic_error": "⚠️ Something went wrong. Please try again.",
+        "contacts_text": (
+            "You can contact Maison de Café via:\n\n"
+            "• Email: maisondecafe.coffee@gmail.com\n"
+            "• Phone: +32 470 600 806\n"
+            "• Telegram channel: https://t.me/maisondecafe\n\n"
+            "If you want — tap “Leave a request” and a manager will contact you within 24 hours."
+        ),
+    },
+    "fr": {
+        "welcome": (
+            "Bonjour !\n"
+            "Je m’appelle Max, assistant virtuel de Maison de Café.\n"
+            "Je peux vous aider sur le lancement, les coûts et les conditions de partenariat.\n"
+            "Pour continuer, comment vous appelez-vous ?"
+        ),
+        "choose_lang": "🌍 Choisissez la langue :",
+        "lang_set": "✅ Langue sélectionnée : {lang}.",
+        "lead_start": "📝 Laisser une demande.\n\nÉtape 1/4 : votre nom et prénom.",
+        "lead_phone": "Étape 2/4 : votre numéro de téléphone.",
+        "lead_email": "Étape 3/4 : votre email.",
+        "lead_msg": "Étape 4/4 : décrivez brièvement votre demande (1–2 phrases).",
+        "lead_done": "Merci ! Demande envoyée. Un manager vous contactera sous 24h.\n\n{email_note}",
+        "voice_fail": "Je n’ai pas pu comprendre le message vocal. Réessayez.",
+        "generic_error": "⚠️ Une erreur est survenue. Réessayez.",
+        "contacts_text": (
+            "Vous pouvez contacter Maison de Café via :\n\n"
+            "• Email : maisondecafe.coffee@gmail.com\n"
+            "• Téléphone : +32 470 600 806\n"
+            "• Canal Telegram : https://t.me/maisondecafe\n\n"
+            "Si vous voulez — cliquez « Laisser une demande » et un manager vous contactera sous 24h."
+        ),
+    },
+    "nl": {
+        "welcome": (
+            "Hallo!\n"
+            "Ik ben Max, de virtuele assistent van Maison de Café.\n"
+            "Ik help je met vragen over startkosten, winst en franchisevoorwaarden.\n"
+            "Om verder te gaan: hoe heet je?"
+        ),
+        "choose_lang": "🌍 Kies een taal:",
+        "lang_set": "✅ Taal ingesteld: {lang}.",
+        "lead_start": "📝 Aanvraag achterlaten.\n\nStap 1/4: Typ je voor- en achternaam.",
+        "lead_phone": "Stap 2/4: Typ je telefoonnummer.",
+        "lead_email": "Stap 3/4: Typ je e-mail.",
+        "lead_msg": "Stap 4/4: Beschrijf kort je vraag (1–2 zinnen).",
+        "lead_done": "Bedankt! Aanvraag verzonden. We nemen binnen 24 uur contact op.\n\n{email_note}",
+        "voice_fail": "Ik kon het spraakbericht niet begrijpen. Probeer het opnieuw.",
+        "generic_error": "⚠️ Er ging iets mis. Probeer het opnieuw.",
+        "contacts_text": (
+            "Contact opnemen met Maison de Café kan via:\n\n"
+            "• E-mail: maisondecafe.coffee@gmail.com\n"
+            "• Telefoon: +32 470 600 806\n"
+            "• Telegram-kanaal: https://t.me/maisondecafe\n\n"
+            "Wil je — klik “Aanvraag achterlaten”, dan nemen we binnen 24 uur contact op."
+        ),
+    },
+}
 
-# Кнопки выбора языка (коротко и понятно)
-LANG_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["🇺🇦 Українська", "🇷🇺 Русский", "🇬🇧 English"],
-        ["🇫🇷 Français", "🇳🇱 Nederlands"],
-        ["⬅️ Назад до меню"],
-    ],
-    resize_keyboard=True
-)
+ASSISTANT_LANG_INSTRUCTIONS = {
+    "ua": "Відповідай українською мовою. Якщо користувач пише іншою мовою — все одно відповідай українською.",
+    "ru": "Отвечай на русском языке.",
+    "en": "Respond in English.",
+    "fr": "Réponds en français.",
+    "nl": "Antwoord in het Nederlands.",
+}
 
-# =========================================================
-# Тексты (минимально необходимые)
-# =========================================================
+# =========================
+# HELPERS
+# =========================
+def get_lang(user_id: str) -> str:
+    return user_lang.get(user_id, "ua")  # по умолчанию украинский
 
-WELCOME_UA = (
-    "Вітаю!\n"
-    "Мене звати Макс — я віртуальний помічник компанії Maison de Café.\n"
-    "Я допоможу вам розібратися з усіма питаннями щодо наших кав’ярень самообслуговування, запуску та умов співпраці.\n\n"
-    "Щоб продовжити, підкажіть, будь ласка, як вас звати?"
-)
+def t(user_id: str, key: str) -> str:
+    lang = get_lang(user_id)
+    return TEXTS.get(lang, TEXTS["ua"]).get(key, TEXTS["ua"].get(key, ""))
 
-LANG_INFO_UA = (
-    "🌍 Оберіть мову. За замовчуванням бот працює українською.\n"
-    "Ви можете змінити мову у будь-який момент через кнопку «🌍 Мова / Language»."
-)
+def mk_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    m = MENU[lang]
+    kb = [
+        [m["what"], m["price"]],
+        [m["payback"], m["franchise"]],
+        [m["contacts"], m["lead"]],
+        [m["lang"]],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-CONTACTS_UA = (
-    "📞 Контакти Maison de Café:\n\n"
-    f"📧 Email: {CONTACT_EMAIL}\n"
-    f"☎️ Телефон: {CONTACT_PHONE}\n"
-    f"🔗 Telegram-канал: {TELEGRAM_CHANNEL}\n\n"
-    "Якщо бажаєте, ви можете залишити заявку — і наш менеджер зв’яжеться з вами протягом 24 годин."
-)
+def mk_lang_keyboard() -> ReplyKeyboardMarkup:
+    kb = [
+        [LANG_LABELS["ua"], LANG_LABELS["ru"]],
+        [LANG_LABELS["en"], LANG_LABELS["fr"]],
+        [LANG_LABELS["nl"]],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
 
-LEAD_INTRO_UA = (
-    "📝 Залишити заявку\n\n"
-    "Я задам кілька коротких питань і передам заявку менеджеру.\n"
-    "Почнемо.\n\n"
-    "1/5 — Ваше ім’я?"
-)
+def parse_lang_choice(text: str) -> Optional[str]:
+    for code, label in LANG_LABELS.items():
+        if text.strip() == label:
+            return code
+    return None
 
-LEAD_CANCEL_UA = "Заявку скасовано. Повертаю вас до меню."
-LEAD_DONE_UA = (
-    "Дякую! ✅ Заявку прийнято.\n"
-    "Наш менеджер зв’яжеться з вами протягом 24 годин.\n\n"
-    f"Якщо потрібно — контакти:\n📧 {CONTACT_EMAIL}\n☎️ {CONTACT_PHONE}\n🔗 {TELEGRAM_CHANNEL}"
-)
+def is_lang_button(text: str) -> bool:
+    text = (text or "").strip()
+    return text in {MENU[l]["lang"] for l in LANGS}
 
-ERROR_UA = "⚠️ Сталася помилка. Спробуйте ще раз, будь ласка."
-AI_ERROR_UA = "⚠️ Помилка під час обробки запиту. Спробуйте ще раз."
+def is_lead_button(text: str) -> bool:
+    text = (text or "").strip()
+    return text in {MENU[l]["lead"] for l in LANGS}
 
-# =========================================================
-# Вспомогательные функции
-# =========================================================
+def is_contacts_button(text: str) -> bool:
+    text = (text or "").strip()
+    return text in {MENU[l]["contacts"] for l in LANGS}
 
-def get_or_create_thread(user_id: str) -> str:
-    """Получить thread_id для пользователя или создать новый."""
+def ensure_thread(user_id: str) -> str:
     if user_id not in user_threads:
         thread = client.beta.threads.create()
         user_threads[user_id] = thread.id
     return user_threads[user_id]
 
-def get_user_language(user_id: str) -> str:
-    """Получить язык пользователя (по умолчанию uk)."""
-    return user_lang.get(user_id, "uk")
+def smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and SMTP_FROM and LEAD_EMAIL_TO)
 
-def set_user_language(user_id: str, lang_code: str) -> None:
-    """Установить язык пользователя."""
-    user_lang[user_id] = lang_code
+def send_lead_email(subject: str, body: str) -> bool:
+    if not smtp_configured():
+        return False
 
-def format_lead_message(lead: dict) -> str:
-    """Сформировать сообщение владельцу по лиду."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return (
-        "🆕 Новий лід (Maison de Café)\n"
-        f"⏱ Час: {ts}\n\n"
-        f"Ім’я: {lead.get('first_name','')}\n"
-        f"Прізвище: {lead.get('last_name','')}\n"
-        f"Телефон: {lead.get('phone','')}\n"
-        f"Email: {lead.get('email','')}\n"
-        f"Запит: {lead.get('note','')}\n"
-    )
-
-async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Отправить владельцу уведомление в Telegram (если OWNER_TELEGRAM_ID задан)."""
-    if not OWNER_TELEGRAM_ID:
-        return
     try:
-        await context.bot.send_message(chat_id=int(OWNER_TELEGRAM_ID), text=text)
-    except Exception:
-        # Не валим бот, если владельцу не отправилось
-        pass
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM
+        msg["To"] = LEAD_EMAIL_TO
 
-# =========================================================
+        with smtplib.SMTP(SMTP_HOST, int(SMTP_PORT)) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_FROM, [LEAD_EMAIL_TO], msg.as_string())
+        return True
+    except Exception as e:
+        print("SMTP ERROR:", repr(e))
+        return False
+
+# =========================
 # /start
-# =========================================================
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
 
-    # Создаём thread заранее
-    get_or_create_thread(user_id)
-
-    # По умолчанию — украинский
+    # default language UA
     if user_id not in user_lang:
-        set_user_language(user_id, "uk")
+        user_lang[user_id] = "ua"
 
-    # Приветствие Макса на украинском + главное меню украинское
-    await update.message.reply_text(WELCOME_UA, reply_markup=MAIN_KEYBOARD_UA)
-    await update.message.reply_text(LANG_INFO_UA, reply_markup=MAIN_KEYBOARD_UA)
+    # create thread for user
+    ensure_thread(user_id)
 
-# =========================================================
-# Команда /language (дополнительно, если нужно)
-# =========================================================
-async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🌍 Оберіть мову:", reply_markup=LANG_KEYBOARD)
+    lang = get_lang(user_id)
+    await update.message.reply_text(
+        TEXTS[lang]["welcome"],
+        reply_markup=mk_main_keyboard(lang),
+    )
 
-# =========================================================
-# Запуск формы лида
-# =========================================================
+# =========================
+# LANGUAGE FLOW
+# =========================
+async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    await update.message.reply_text(t(user_id, "choose_lang"), reply_markup=mk_lang_keyboard())
+
+async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_code: str):
+    user_id = str(update.effective_user.id)
+    user_lang[user_id] = lang_code
+
+    await update.message.reply_text(
+        t(user_id, "lang_set").format(lang=LANG_LABELS[lang_code]),
+        reply_markup=mk_main_keyboard(lang_code),
+    )
+
+# =========================
+# LEAD FORM FLOW
+# =========================
 async def start_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    lead_state[user_id] = {"step": 1, "data": {}}
-    await update.message.reply_text(LEAD_INTRO_UA, reply_markup=ReplyKeyboardRemove())
+    lead_states[user_id] = "name"
+    lead_data[user_id] = {}
 
-async def cancel_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    if user_id in lead_state:
-        del lead_state[user_id]
-    await update.message.reply_text(LEAD_CANCEL_UA, reply_markup=MAIN_KEYBOARD_UA)
+    await update.message.reply_text(
+        t(user_id, "lead_start"),
+        reply_markup=mk_main_keyboard(get_lang(user_id)),
+    )
 
-# =========================================================
-# Обработка текста в режиме лида
-# =========================================================
-async def handle_lead_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    Возвращает True, если сообщение обработано как часть lead-формы.
-    False — если не в режиме формы.
-    """
+async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    if user_id not in lead_state:
+    lang = get_lang(user_id)
+
+    step = lead_states.get(user_id)
+    text = (update.message.text or "").strip()
+
+    if not step:
         return False
 
-    text = (update.message.text or "").strip()
-    st = lead_state[user_id]
-    step = st.get("step", 1)
-    data = st.get("data", {})
-
-    # Возможность отмены
-    if text.lower() in ["скасувати", "отмена", "cancel", "/cancel"]:
-        await cancel_lead_form(update, context)
+    if step == "name":
+        lead_data[user_id]["name"] = text
+        lead_states[user_id] = "phone"
+        await update.message.reply_text(TEXTS[lang]["lead_phone"], reply_markup=mk_main_keyboard(lang))
         return True
 
-    # Шаги формы: 1 имя, 2 фамилия, 3 телефон, 4 email, 5 запрос
-    if step == 1:
-        data["first_name"] = text
-        st["step"] = 2
-        await update.message.reply_text("2/5 — Ваше прізвище?")
+    if step == "phone":
+        lead_data[user_id]["phone"] = text
+        lead_states[user_id] = "email"
+        await update.message.reply_text(TEXTS[lang]["lead_email"], reply_markup=mk_main_keyboard(lang))
         return True
 
-    if step == 2:
-        data["last_name"] = text
-        st["step"] = 3
-        await update.message.reply_text("3/5 — Ваш номер телефону (у міжнародному форматі, напр. +32...) ?")
+    if step == "email":
+        lead_data[user_id]["email"] = text
+        lead_states[user_id] = "message"
+        await update.message.reply_text(TEXTS[lang]["lead_msg"], reply_markup=mk_main_keyboard(lang))
         return True
 
-    if step == 3:
-        data["phone"] = text
-        st["step"] = 4
-        await update.message.reply_text("4/5 — Ваш email?")
+    if step == "message":
+        lead_data[user_id]["message"] = text
+        lead_states.pop(user_id, None)
+
+        # Prepare lead payload
+        username = update.effective_user.username or ""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        payload = (
+            f"Telegram user_id: {user_id}\n"
+            f"Username: @{username}\n"
+            f"Ім'я/Прізвище: {lead_data[user_id].get('name','')}\n"
+            f"Телефон: {lead_data[user_id].get('phone','')}\n"
+            f"Email: {lead_data[user_id].get('email','')}\n"
+            f"Повідомлення: {lead_data[user_id].get('message','')}\n"
+            f"Час: {now}\n"
+        )
+
+        # Notify owner in Telegram
+        owner_notified = False
+        if OWNER_TELEGRAM_ID:
+            try:
+                await context.bot.send_message(chat_id=int(OWNER_TELEGRAM_ID), text=payload)
+                owner_notified = True
+            except Exception as e:
+                print("OWNER TG NOTIFY ERROR:", repr(e))
+
+        # Optional email
+        email_sent = send_lead_email("Maison de Café — New lead", payload)
+
+        if email_sent:
+            email_note = "✅ Email-сповіщення відправлено."
+        else:
+            email_note = "Примітка: відправка на email не налаштована (SMTP). Сповіщення власнику відправлено в Telegram." if owner_notified else "Примітка: email (SMTP) не налаштовано, і Telegram-сповіщення власнику не відправлено."
+
+        await update.message.reply_text(
+            TEXTS[lang]["lead_done"].format(email_note=email_note),
+            reply_markup=mk_main_keyboard(lang),
+        )
+
+        lead_data.pop(user_id, None)
         return True
 
-    if step == 4:
-        data["email"] = text
-        st["step"] = 5
-        await update.message.reply_text("5/5 — Коротко опишіть ваш запит (1–2 речення):")
-        return True
+    return False
 
-    if step == 5:
-        data["note"] = text
+# =========================
+# ASSISTANT (text)
+# =========================
+async def ask_assistant(user_id: str, user_text: str) -> str:
+    thread_id = ensure_thread(user_id)
+    lang = get_lang(user_id)
 
-        # Отправляем владельцу в Telegram
-        owner_text = format_lead_message(data)
-        await notify_owner(context, owner_text)
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=user_text,
+    )
 
-        # Завершаем
-        del lead_state[user_id]
-        await update.message.reply_text(LEAD_DONE_UA, reply_markup=MAIN_KEYBOARD_UA)
-        return True
+    run = client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=ASSISTANT_ID,
+        instructions=ASSISTANT_LANG_INSTRUCTIONS.get(lang, ASSISTANT_LANG_INSTRUCTIONS["ua"]),
+    )
 
-    # На всякий случай
-    await update.message.reply_text(ERROR_UA, reply_markup=MAIN_KEYBOARD_UA)
-    return True
+    # wait completion
+    while True:
+        run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        if run_status.status == "completed":
+            break
+        if run_status.status in ["failed", "cancelled", "expired"]:
+            return ""
+        await asyncio.sleep(1)
 
-# =========================================================
-# Основной обработчик сообщений (текст)
-# =========================================================
+    messages = client.beta.threads.messages.list(thread_id=thread_id)
+    if not messages.data:
+        return ""
+
+    return messages.data[0].content[0].text.value
+
+# =========================
+# TEXT HANDLER
+# =========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    user_text = (update.message.text or "").strip()
+    lang = get_lang(user_id)
+    text = (update.message.text or "").strip()
 
-    # 1) Если пользователь в форме лида — обрабатываем форму
-    if await handle_lead_flow(update, context):
+    # Lead form step processing (priority)
+    if user_id in lead_states:
+        handled = await handle_lead_form(update, context)
+        if handled:
+            return
+
+    # Open language menu
+    if is_lang_button(text):
+        await show_language_menu(update, context)
         return
 
-    # 2) Обработка кнопок меню (UA)
-    if user_text == "🌍 Мова / Language":
-        await update.message.reply_text("🌍 Оберіть мову:", reply_markup=LANG_KEYBOARD)
+    # Choose language
+    chosen = parse_lang_choice(text)
+    if chosen:
+        await set_language(update, context, chosen)
         return
 
-    if user_text in ["⬅️ Назад до меню", "Назад", "Back"]:
-        await update.message.reply_text("Готово. Повертаю вас до меню.", reply_markup=MAIN_KEYBOARD_UA)
-        return
-
-    # Выбор языка
-    if user_text == "🇺🇦 Українська":
-        set_user_language(user_id, "uk")
-        await update.message.reply_text("✅ Мову змінено: Українська.", reply_markup=MAIN_KEYBOARD_UA)
-        return
-
-    if user_text == "🇷🇺 Русский":
-        set_user_language(user_id, "ru")
-        await update.message.reply_text("✅ Язык изменён: Русский.", reply_markup=MAIN_KEYBOARD_UA)
-        return
-
-    if user_text == "🇬🇧 English":
-        set_user_language(user_id, "en")
-        await update.message.reply_text("✅ Language set: English.", reply_markup=MAIN_KEYBOARD_UA)
-        return
-
-    if user_text == "🇫🇷 Français":
-        set_user_language(user_id, "fr")
-        await update.message.reply_text("✅ Langue définie : Français.", reply_markup=MAIN_KEYBOARD_UA)
-        return
-
-    if user_text == "🇳🇱 Nederlands":
-        set_user_language(user_id, "nl")
-        await update.message.reply_text("✅ Taal ingesteld: Nederlands.", reply_markup=MAIN_KEYBOARD_UA)
-        return
-
-    # Контакты
-    if user_text == "📞 Контакти / зв’язок з власником":
-        await update.message.reply_text(CONTACTS_UA, reply_markup=MAIN_KEYBOARD_UA)
-        return
-
-    # Лид-форма
-    if user_text == "📝 Залишити заявку":
+    # Lead form start
+    if is_lead_button(text):
         await start_lead_form(update, context)
         return
 
-    # 3) Всё остальное — передаём в OpenAI Assistant
-    thread_id = get_or_create_thread(user_id)
-    lang = get_user_language(user_id)
+    # Contacts (static)
+    if is_contacts_button(text):
+        await update.message.reply_text(TEXTS[lang]["contacts_text"], reply_markup=mk_main_keyboard(lang))
+        return
 
-    # Подсказка ассистенту о языке (чтобы он отвечал на выбранном языке)
-    # Это не заменяет System Instructions, а мягко направляет ответы.
-    language_hint = {
-        "uk": "Відповідай українською мовою.",
-        "ru": "Отвечай на русском языке.",
-        "en": "Reply in English.",
-        "fr": "Réponds en français.",
-        "nl": "Antwoord in het Nederlands.",
-    }.get(lang, "Відповідай українською мовою.")
+    # Otherwise -> assistant
+    try:
+        ai_reply = await ask_assistant(user_id, text)
+        if not ai_reply:
+            await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
+            return
+        await update.message.reply_text(ai_reply, reply_markup=mk_main_keyboard(lang))
+    except Exception as e:
+        print("ASSISTANT ERROR:", repr(e))
+        await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
+
+# =========================
+# VOICE HANDLER
+# =========================
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    lang = get_lang(user_id)
 
     try:
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=f"{language_hint}\n\nКористувач: {user_text}",
+        voice = update.message.voice
+        tg_file = await context.bot.get_file(voice.file_id)
+
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        buf.seek(0)
+        buf.name = "voice.ogg"
+
+        transcript = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=buf,
         )
+        user_text = (transcript.text or "").strip()
 
-        run = client.beta.threads.runs.create(
-            thread_id=thread_id,
-            assistant_id=ASSISTANT_ID,
-        )
-
-        # Ждём завершения
-        while True:
-            run_status = client.beta.threads.runs.retrieve(
-                thread_id=thread_id,
-                run_id=run.id,
-            )
-            if run_status.status == "completed":
-                break
-            if run_status.status in ["failed", "cancelled", "expired"]:
-                await update.message.reply_text(AI_ERROR_UA, reply_markup=MAIN_KEYBOARD_UA)
-                return
-            await asyncio.sleep(1)
-
-        messages = client.beta.threads.messages.list(thread_id=thread_id)
-        if not messages.data:
-            await update.message.reply_text(AI_ERROR_UA, reply_markup=MAIN_KEYBOARD_UA)
+        if not user_text:
+            await update.message.reply_text(TEXTS[lang]["voice_fail"], reply_markup=mk_main_keyboard(lang))
             return
 
-        ai_reply = messages.data[0].content[0].text.value
-        await update.message.reply_text(ai_reply, reply_markup=MAIN_KEYBOARD_UA)
+        # Если пользователь был в лид-форме — считаем транскрипт как ввод в лид-форму
+        if user_id in lead_states:
+            # Подменяем текст и обрабатываем как текст
+            update.message.text = user_text
+            await handle_message(update, context)
+            return
 
-    except Exception:
-        await update.message.reply_text(ERROR_UA, reply_markup=MAIN_KEYBOARD_UA)
+        # обычный поток: отправляем транскрипт в ассистент
+        ai_reply = await ask_assistant(user_id, user_text)
+        if not ai_reply:
+            await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
+            return
 
-# =========================================================
-# /cancel — отмена формы лида (если пользователь застрял)
-# =========================================================
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cancel_lead_form(update, context)
+        await update.message.reply_text(ai_reply, reply_markup=mk_main_keyboard(lang))
 
-# =========================================================
-# Точка входа
-# =========================================================
+    except Exception as e:
+        print("VOICE ERROR:", repr(e))
+        await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
+
+# =========================
+# ENTRYPOINT
+# =========================
 def main():
-    print("🚀 Maison de Café bot starting...")
+    print("🚀 Bot is starting...")
 
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("language", language_command))
-    application.add_handler(CommandHandler("cancel", cancel))
 
-    # Text messages
+    # voice must be BEFORE generic text (not strictly required, но так надежнее)
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # IMPORTANT:
-    # Мы используем polling.
-    # Если увидишь ошибку Conflict: terminated by other getUpdates request —
-    # значит где-то запущен второй экземпляр бота с тем же токеном.
     application.run_polling()
 
 if __name__ == "__main__":
