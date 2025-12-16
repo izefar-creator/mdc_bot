@@ -1,10 +1,11 @@
 import os
 import io
+import re
 import asyncio
 import smtplib
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 
 from dotenv import load_dotenv
 
@@ -28,7 +29,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID")  # обязательный для уведомлений владельцу
+OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID")  # for admin + lead notifications
 LEAD_EMAIL_TO = os.getenv("LEAD_EMAIL_TO", "maisondecafe.coffee@gmail.com")
 
 SMTP_HOST = os.getenv("SMTP_HOST")
@@ -55,6 +56,20 @@ user_lang: Dict[str, str] = {}      # user_id -> lang (ua/ru/en/fr/nl)
 lead_states: Dict[str, str] = {}    # user_id -> step: name/phone/email/message
 lead_data: Dict[str, Dict[str, str]] = {}  # user_id -> collected fields
 
+# --- anti-spam state ---
+user_msg_times: Dict[str, List[datetime]] = {}     # user_id -> timestamps of recent messages
+user_last_text: Dict[str, str] = {}                # user_id -> last message (text after normalize)
+user_repeat_count: Dict[str, int] = {}             # user_id -> repeats
+user_spam_strikes: Dict[str, int] = {}             # user_id -> strikes
+user_cooldown_until: Dict[str, datetime] = {}      # user_id -> ignore until
+
+# --- admin moderation ---
+banned_users: Dict[str, datetime] = {}             # user_id -> banned_until (datetime.max for permanent)
+
+# --- debug ---
+user_last_debug: Dict[str, str] = {}               # user_id -> last debug line
+
+
 # =========================
 # I18N (texts + buttons)
 # =========================
@@ -68,7 +83,7 @@ LANG_LABELS = {
     "nl": "🇳🇱 Nederlands",
 }
 
-# Главное меню (кнопки) — локализовано
+# MENU buttons (localized)
 MENU = {
     "ua": {
         "what": "☕ Що таке Maison de Café?",
@@ -137,6 +152,10 @@ TEXTS = {
         ),
         "voice_fail": "Не вдалося розпізнати голос. Спробуйте ще раз.",
         "generic_error": "⚠️ Сталася помилка. Спробуйте ще раз.",
+        "spam_warn_1": "Схоже, це не запитання 🙂 Я із задоволенням допоможу, якщо напишете конкретніше про Maison de Café.",
+        "spam_warn_2": "Я можу відповідати лише на осмислені запити, пов’язані з Maison de Café. Напишіть, будь ласка, що саме вас цікавить.",
+        "cooldown_msg": "Я тимчасово призупиняю відповіді на повторювані/спам-повідомлення. Спробуйте ще раз трохи пізніше.",
+        "banned_msg": "Доступ тимчасово обмежено. Якщо це помилка — напишіть менеджеру: maisondecafe.coffee@gmail.com",
         "contacts_text": (
             "Зв’язатися з Maison de Café можна так:\n\n"
             "• Email: maisondecafe.coffee@gmail.com\n"
@@ -164,6 +183,10 @@ TEXTS = {
         ),
         "voice_fail": "Не удалось распознать голос. Попробуйте ещё раз.",
         "generic_error": "⚠️ Произошла ошибка. Попробуйте ещё раз.",
+        "spam_warn_1": "Похоже, это не вопрос 🙂 Я помогу, если вы уточните запрос про Maison de Café.",
+        "spam_warn_2": "Я могу отвечать только на осмысленные вопросы, связанные с Maison de Café. Напишите, пожалуйста, что именно вас интересует.",
+        "cooldown_msg": "Я временно перестану отвечать на повторяющиеся/спам-сообщения. Попробуйте чуть позже.",
+        "banned_msg": "Доступ временно ограничен. Если это ошибка — напишите менеджеру: maisondecafe.coffee@gmail.com",
         "contacts_text": (
             "Связаться с Maison de Café можно так:\n\n"
             "• Email: maisondecafe.coffee@gmail.com\n"
@@ -188,6 +211,10 @@ TEXTS = {
         "lead_done": "Thank you! Request sent. Our manager will contact you within 24 hours.\n\n{email_note}",
         "voice_fail": "I couldn't understand the voice message. Please try again.",
         "generic_error": "⚠️ Something went wrong. Please try again.",
+        "spam_warn_1": "This doesn't look like a real question 🙂 Please ask something specific about Maison de Café.",
+        "spam_warn_2": "I can only answer meaningful questions related to Maison de Café. Please tell me what you need.",
+        "cooldown_msg": "I’m temporarily pausing replies to repeated/spam messages. Please try again later.",
+        "banned_msg": "Access is temporarily limited. If this is a mistake, contact: maisondecafe.coffee@gmail.com",
         "contacts_text": (
             "You can contact Maison de Café via:\n\n"
             "• Email: maisondecafe.coffee@gmail.com\n"
@@ -212,6 +239,10 @@ TEXTS = {
         "lead_done": "Merci ! Demande envoyée. Un manager vous contactera sous 24h.\n\n{email_note}",
         "voice_fail": "Je n’ai pas pu comprendre le message vocal. Réessayez.",
         "generic_error": "⚠️ Une erreur est survenue. Réessayez.",
+        "spam_warn_1": "Cela ne ressemble pas à une vraie question 🙂 Posez une question précise sur Maison de Café.",
+        "spam_warn_2": "Je réponds uniquement aux questions pertinentes sur Maison de Café. Dites-moi ce dont vous avez besoin.",
+        "cooldown_msg": "Je suspends temporairement les réponses aux messages répétitifs/spam. Réessayez plus tard.",
+        "banned_msg": "Accès temporairement limité. Si c’est une erreur : maisondecafe.coffee@gmail.com",
         "contacts_text": (
             "Vous pouvez contacter Maison de Café via :\n\n"
             "• Email : maisondecafe.coffee@gmail.com\n"
@@ -236,6 +267,10 @@ TEXTS = {
         "lead_done": "Bedankt! Aanvraag verzonden. We nemen binnen 24 uur contact op.\n\n{email_note}",
         "voice_fail": "Ik kon het spraakbericht niet begrijpen. Probeer het opnieuw.",
         "generic_error": "⚠️ Er ging iets mis. Probeer het opnieuw.",
+        "spam_warn_1": "Dit lijkt geen echte vraag 🙂 Stel een concrete vraag over Maison de Café.",
+        "spam_warn_2": "Ik kan alleen zinvolle vragen over Maison de Café beantwoorden. Wat wil je precies weten?",
+        "cooldown_msg": "Ik pauzeer tijdelijk reacties op herhaalde/spam-berichten. Probeer later opnieuw.",
+        "banned_msg": "Toegang tijdelijk beperkt. Als dit een vergissing is: maisondecafe.coffee@gmail.com",
         "contacts_text": (
             "Contact opnemen met Maison de Café kan via:\n\n"
             "• E-mail: maisondecafe.coffee@gmail.com\n"
@@ -246,6 +281,7 @@ TEXTS = {
     },
 }
 
+# Language behavior (base)
 ASSISTANT_LANG_INSTRUCTIONS = {
     "ua": "Відповідай українською мовою. Якщо користувач пише іншою мовою — все одно відповідай українською.",
     "ru": "Отвечай на русском языке.",
@@ -255,10 +291,44 @@ ASSISTANT_LANG_INSTRUCTIONS = {
 }
 
 # =========================
+# KB-ONLY + HUMAN STYLE (core)
+# =========================
+def build_core_instructions(lang: str, mode: str) -> str:
+    """
+    mode:
+      - KB_ONLY: strictly from knowledge base
+      - LEAD_MODE: short, guiding user to leave contacts + clarify
+    """
+    lang_instr = ASSISTANT_LANG_INSTRUCTIONS.get(lang, ASSISTANT_LANG_INSTRUCTIONS["ua"])
+
+    kb_rules = (
+        "ВАЖЛИВО: Відповідай ТІЛЬКИ на основі бази знань Maison de Café, яка прикріплена до цього ассистента. "
+        "НЕ вигадуй і НЕ припускай. НЕ використовуй зовнішні джерела. "
+        "Якщо точної відповіді немає у базі знань — чесно скажи, що у базі цього немає, "
+        "і запропонуй залишити заявку (кнопка «Залишити заявку / Leave a request»), щоб менеджер відповів персонально."
+    )
+
+    human_style = (
+        "Тон: максимально людяний, дружній, але професійний. "
+        "Без роботських фраз типу «як ШІ…». "
+        "Структура відповіді: коротко 1-2 речення по суті, далі 3-7 пунктів (•), наприкінці 1 CTA-рядок."
+    )
+
+    if mode == "LEAD_MODE":
+        lead_style = (
+            "Режим LEAD: відповідай дуже коротко і веди користувача до залишення контактів. "
+            "Якщо користувач питає щось складне — коротко поясни по базі знань і одразу запропонуй залишити заявку."
+        )
+        return f"{lang_instr}\n\n{kb_rules}\n\n{human_style}\n\n{lead_style}"
+
+    return f"{lang_instr}\n\n{kb_rules}\n\n{human_style}"
+
+
+# =========================
 # HELPERS
 # =========================
 def get_lang(user_id: str) -> str:
-    return user_lang.get(user_id, "ua")  # по умолчанию украинский
+    return user_lang.get(user_id, "ua")  # default Ukrainian
 
 def t(user_id: str, key: str) -> str:
     lang = get_lang(user_id)
@@ -328,17 +398,188 @@ def send_lead_email(subject: str, body: str) -> bool:
         print("SMTP ERROR:", repr(e))
         return False
 
+def now_utc() -> datetime:
+    # keep simple; Render logs use UTC typically. Not critical.
+    return datetime.utcnow()
+
+def is_owner(user_id: str) -> bool:
+    return bool(OWNER_TELEGRAM_ID) and str(user_id) == str(OWNER_TELEGRAM_ID)
+
+def normalize_text_for_spam(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+def user_in_cooldown(user_id: str) -> bool:
+    until = user_cooldown_until.get(user_id)
+    if not until:
+        return False
+    if now_utc() >= until:
+        user_cooldown_until.pop(user_id, None)
+        return False
+    return True
+
+def user_is_banned(user_id: str) -> bool:
+    until = banned_users.get(user_id)
+    if not until:
+        return False
+    if until == datetime.max:
+        return True
+    if now_utc() < until:
+        return True
+    banned_users.pop(user_id, None)
+    return False
+
+def mark_debug(user_id: str, msg: str) -> None:
+    user_last_debug[user_id] = msg
+
+
+# =========================
+# ANTI-SPAM
+# =========================
+SPAM_WINDOW_SECONDS = 12
+SPAM_MAX_MSGS_IN_WINDOW = 6  # >6 messages in 12 sec => cooldown
+SPAM_COOLDOWN_SECONDS = 60   # cooldown after rate-limit
+
+REPEAT_SAME_MSG_THRESHOLD = 3  # same normalized message 3 times => cooldown
+SPAM_STRIKES_TO_COOLDOWN = 2   # after 2 strikes => cooldown
+SPAM_STRIKE_COOLDOWN_SECONDS = 120
+
+def looks_like_gibberish(text: str) -> bool:
+    """
+    Detect patterns like: "оооооо", "ла-ла-ла", "....", random repeats, etc.
+    This is conservative to reduce false positives.
+    """
+    if not text:
+        return True
+
+    raw = text.strip()
+    if len(raw) <= 2:
+        return True
+
+    # many repeated same character (e.g. ooooooo, .......)
+    if re.fullmatch(r"(.)\1{6,}", raw, flags=re.DOTALL):
+        return True
+
+    # repeated syllables/words (e.g. "ла ла ла ла", "тра-ля-ля", "ооо ооо")
+    simplified = re.sub(r"[^a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]+", " ", raw.lower()).strip()
+    if simplified:
+        parts = simplified.split()
+        if len(parts) >= 4 and len(set(parts)) == 1:
+            return True
+
+    # mostly punctuation
+    letters_digits = sum(ch.isalnum() for ch in raw)
+    if letters_digits <= max(2, int(len(raw) * 0.15)):
+        return True
+
+    # excessive repeated bigrams like "lolololol", "ooooaa"
+    if re.search(r"(..)\1{4,}", raw.lower()):
+        return True
+
+    return False
+
+def anti_spam_check(user_id: str, text: str) -> Tuple[bool, Optional[str]]:
+    """
+    Returns (should_ignore, optional_reply_to_user).
+    should_ignore True => do not call OpenAI (no token burn).
+    """
+    # banned check first
+    if user_is_banned(user_id):
+        return True, t(user_id, "banned_msg")
+
+    # cooldown check
+    if user_in_cooldown(user_id):
+        return True, None
+
+    ntext = normalize_text_for_spam(text)
+
+    # rate limit
+    now = now_utc()
+    times = user_msg_times.get(user_id, [])
+    times = [ts for ts in times if (now - ts).total_seconds() <= SPAM_WINDOW_SECONDS]
+    times.append(now)
+    user_msg_times[user_id] = times
+
+    if len(times) > SPAM_MAX_MSGS_IN_WINDOW:
+        user_cooldown_until[user_id] = now + timedelta(seconds=SPAM_COOLDOWN_SECONDS)
+        return True, t(user_id, "cooldown_msg")
+
+    # repeat check
+    last = user_last_text.get(user_id, "")
+    if ntext and ntext == last:
+        user_repeat_count[user_id] = user_repeat_count.get(user_id, 0) + 1
+    else:
+        user_repeat_count[user_id] = 0
+        user_last_text[user_id] = ntext
+
+    if user_repeat_count.get(user_id, 0) >= REPEAT_SAME_MSG_THRESHOLD:
+        user_cooldown_until[user_id] = now + timedelta(seconds=SPAM_STRIKE_COOLDOWN_SECONDS)
+        return True, t(user_id, "cooldown_msg")
+
+    # gibberish check
+    if looks_like_gibberish(text):
+        strikes = user_spam_strikes.get(user_id, 0) + 1
+        user_spam_strikes[user_id] = strikes
+
+        if strikes == 1:
+            return True, t(user_id, "spam_warn_1")
+        if strikes == 2:
+            return True, t(user_id, "spam_warn_2")
+
+        # cooldown after repeated strikes
+        if strikes >= SPAM_STRIKES_TO_COOLDOWN:
+            user_cooldown_until[user_id] = now + timedelta(seconds=SPAM_STRIKE_COOLDOWN_SECONDS)
+            return True, t(user_id, "cooldown_msg")
+
+    # looks ok
+    return False, None
+
+
+# =========================
+# BUTTON -> COMMAND PROMPT MAPPING
+# =========================
+def button_to_prompt(lang: str, pressed_text: str) -> Optional[str]:
+    """
+    Convert menu button presses into strong, non-ambiguous prompts
+    so the assistant answers about Maison de Café (not generic).
+    """
+    m = MENU[lang]
+
+    if pressed_text == m["what"]:
+        return (
+            "Поясни, що таке Maison de Café: що саме купує клієнт, що входить у рішення під ключ, "
+            "як працює кав’ярня самообслуговування. Дай відповідь структуровано і додай CTA (залишити заявку)."
+        )
+    if pressed_text == m["price"]:
+        return (
+            "Поясни вартість відкриття кав’ярні самообслуговування Maison de Café. "
+            "Що входить у базову вартість, які є регулярні платежі (термінал/послуги), "
+            "як оплачується (60% аванс / 40% при передачі). Структуровано + CTA."
+        )
+    if pressed_text == m["payback"]:
+        return (
+            "Поясни окупність та прибуток: базова модель (35 чашок/день), середня маржа, "
+            "що впливає на окупність, які ризики та що робити якщо локація слабка. Структуровано + CTA."
+        )
+    if pressed_text == m["franchise"]:
+        return (
+            "Поясни умови співпраці Maison de Café: формат договору послуг, підтримка, інгредієнти, "
+            "обов’язки сторін, гарантія, релокація. Структуровано + CTA."
+        )
+    # contacts and lead handled elsewhere
+    return None
+
+
 # =========================
 # /start
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
 
-    # default language UA
     if user_id not in user_lang:
         user_lang[user_id] = "ua"
 
-    # create thread for user
     ensure_thread(user_id)
 
     lang = get_lang(user_id)
@@ -346,6 +587,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         TEXTS[lang]["welcome"],
         reply_markup=mk_main_keyboard(lang),
     )
+
 
 # =========================
 # LANGUAGE FLOW
@@ -357,69 +599,87 @@ async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_code: str):
     user_id = str(update.effective_user.id)
     user_lang[user_id] = lang_code
-
     await update.message.reply_text(
         t(user_id, "lang_set").format(lang=LANG_LABELS[lang_code]),
         reply_markup=mk_main_keyboard(lang_code),
     )
 
+
 # =========================
 # LEAD FORM FLOW
 # =========================
+def sanitize_phone(s: str) -> str:
+    return re.sub(r"[^\d\+\-\s\(\)]", "", (s or "").strip())
+
+def is_valid_email(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", s))
+
 async def start_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     lead_states[user_id] = "name"
     lead_data[user_id] = {}
-
     await update.message.reply_text(
         t(user_id, "lead_start"),
         reply_markup=mk_main_keyboard(get_lang(user_id)),
     )
 
-async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+async def handle_lead_form_text(user_id: str, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
     lang = get_lang(user_id)
-
     step = lead_states.get(user_id)
-    text = (update.message.text or "").strip()
+    text = (text or "").strip()
 
     if not step:
         return False
 
     if step == "name":
+        if len(text) < 2:
+            await update.message.reply_text(TEXTS[lang]["lead_start"], reply_markup=mk_main_keyboard(lang))
+            return True
         lead_data[user_id]["name"] = text
         lead_states[user_id] = "phone"
         await update.message.reply_text(TEXTS[lang]["lead_phone"], reply_markup=mk_main_keyboard(lang))
         return True
 
     if step == "phone":
-        lead_data[user_id]["phone"] = text
+        phone = sanitize_phone(text)
+        if len(re.sub(r"\D", "", phone)) < 7:
+            await update.message.reply_text(TEXTS[lang]["lead_phone"], reply_markup=mk_main_keyboard(lang))
+            return True
+        lead_data[user_id]["phone"] = phone
         lead_states[user_id] = "email"
         await update.message.reply_text(TEXTS[lang]["lead_email"], reply_markup=mk_main_keyboard(lang))
         return True
 
     if step == "email":
+        if not is_valid_email(text):
+            await update.message.reply_text(TEXTS[lang]["lead_email"], reply_markup=mk_main_keyboard(lang))
+            return True
         lead_data[user_id]["email"] = text
         lead_states[user_id] = "message"
         await update.message.reply_text(TEXTS[lang]["lead_msg"], reply_markup=mk_main_keyboard(lang))
         return True
 
     if step == "message":
+        if len(text) < 3:
+            await update.message.reply_text(TEXTS[lang]["lead_msg"], reply_markup=mk_main_keyboard(lang))
+            return True
+
         lead_data[user_id]["message"] = text
         lead_states.pop(user_id, None)
 
-        # Prepare lead payload
         username = update.effective_user.username or ""
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         payload = (
+            f"Maison de Café — NEW LEAD\n"
             f"Telegram user_id: {user_id}\n"
             f"Username: @{username}\n"
-            f"Ім'я/Прізвище: {lead_data[user_id].get('name','')}\n"
-            f"Телефон: {lead_data[user_id].get('phone','')}\n"
+            f"Name: {lead_data[user_id].get('name','')}\n"
+            f"Phone: {lead_data[user_id].get('phone','')}\n"
             f"Email: {lead_data[user_id].get('email','')}\n"
-            f"Повідомлення: {lead_data[user_id].get('message','')}\n"
-            f"Час: {now}\n"
+            f"Message: {lead_data[user_id].get('message','')}\n"
+            f"Time: {now_local}\n"
         )
 
         # Notify owner in Telegram
@@ -437,7 +697,12 @@ async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if email_sent:
             email_note = "✅ Email-сповіщення відправлено."
         else:
-            email_note = "Примітка: відправка на email не налаштована (SMTP). Сповіщення власнику відправлено в Telegram." if owner_notified else "Примітка: email (SMTP) не налаштовано, і Telegram-сповіщення власнику не відправлено."
+            email_note = (
+                "Примітка: відправка на email не налаштована (SMTP). "
+                "Сповіщення власнику відправлено в Telegram."
+                if owner_notified else
+                "Примітка: email (SMTP) не налаштовано, і Telegram-сповіщення власнику не відправлено."
+            )
 
         await update.message.reply_text(
             TEXTS[lang]["lead_done"].format(email_note=email_note),
@@ -449,31 +714,39 @@ async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return False
 
+
 # =========================
 # ASSISTANT (text)
 # =========================
-async def ask_assistant(user_id: str, user_text: str) -> str:
+async def ask_assistant(user_id: str, user_text: str, mode: str = "KB_ONLY") -> str:
     thread_id = ensure_thread(user_id)
     lang = get_lang(user_id)
 
+    # message
     client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
         content=user_text,
     )
 
+    # run with strong instructions
+    instructions = build_core_instructions(lang=lang, mode=mode)
+
     run = client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
-        instructions=ASSISTANT_LANG_INSTRUCTIONS.get(lang, ASSISTANT_LANG_INSTRUCTIONS["ua"]),
+        instructions=instructions,
     )
 
-    # wait completion
+    # wait completion with timeout
+    start_ts = now_utc()
     while True:
         run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
         if run_status.status == "completed":
             break
         if run_status.status in ["failed", "cancelled", "expired"]:
+            return ""
+        if (now_utc() - start_ts).total_seconds() > 60:
             return ""
         await asyncio.sleep(1)
 
@@ -481,19 +754,145 @@ async def ask_assistant(user_id: str, user_text: str) -> str:
     if not messages.data:
         return ""
 
-    return messages.data[0].content[0].text.value
+    # newest assistant message usually at index 0, but safe-check content
+    try:
+        return messages.data[0].content[0].text.value
+    except Exception:
+        return ""
+
 
 # =========================
-# TEXT HANDLER
+# ADMIN COMMANDS
 # =========================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    lang = get_lang(user_id)
-    text = (update.message.text or "").strip()
+    if not is_owner(user_id):
+        return
 
-    # Lead form step processing (priority)
+    total_threads = len(user_threads)
+    total_lang = len(user_lang)
+    total_leads_in_progress = len(lead_states)
+    total_banned = len([u for u in banned_users.keys() if user_is_banned(u)])
+
+    msg = (
+        "📊 Bot status\n"
+        f"Threads: {total_threads}\n"
+        f"Users with lang: {total_lang}\n"
+        f"Lead forms in progress: {total_leads_in_progress}\n"
+        f"Banned users: {total_banned}\n"
+    )
+    await update.message.reply_text(msg)
+
+async def admin_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_owner(user_id):
+        return
+
+    # If passed a user id: /debug 12345
+    target = None
+    if context.args:
+        target = str(context.args[0]).strip()
+    else:
+        target = user_id
+
+    dbg = user_last_debug.get(target, "(no debug info)")
+    await update.message.reply_text(f"🧩 Debug for {target}:\n{dbg}")
+
+async def admin_setlang(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_owner(user_id):
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /setlang <user_id> <ua|ru|en|fr|nl>")
+        return
+
+    target = str(context.args[0]).strip()
+    lang = str(context.args[1]).strip().lower()
+    if lang not in LANGS:
+        await update.message.reply_text("Invalid lang. Use: ua|ru|en|fr|nl")
+        return
+
+    user_lang[target] = lang
+    await update.message.reply_text(f"✅ Set language for {target} => {lang}")
+
+async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_owner(user_id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <user_id> [minutes|perm]")
+        return
+
+    target = str(context.args[0]).strip()
+    dur = "perm"
+    if len(context.args) >= 2:
+        dur = str(context.args[1]).strip().lower()
+
+    if dur == "perm":
+        banned_users[target] = datetime.max
+        await update.message.reply_text(f"⛔ Permanently banned {target}")
+        return
+
+    try:
+        mins = int(dur)
+        banned_users[target] = now_utc() + timedelta(minutes=mins)
+        await update.message.reply_text(f"⛔ Banned {target} for {mins} minutes")
+    except Exception:
+        await update.message.reply_text("Invalid duration. Use minutes number or 'perm'.")
+
+async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_owner(user_id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <user_id>")
+        return
+
+    target = str(context.args[0]).strip()
+    banned_users.pop(target, None)
+    await update.message.reply_text(f"✅ Unbanned {target}")
+
+async def admin_limits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not is_owner(user_id):
+        return
+
+    msg = (
+        "⚙️ Limits\n"
+        f"Rate window: {SPAM_WINDOW_SECONDS}s\n"
+        f"Max msgs in window: {SPAM_MAX_MSGS_IN_WINDOW}\n"
+        f"Cooldown (rate): {SPAM_COOLDOWN_SECONDS}s\n"
+        f"Repeat threshold: {REPEAT_SAME_MSG_THRESHOLD}\n"
+        f"Cooldown (strikes): {SPAM_STRIKE_COOLDOWN_SECONDS}s\n"
+    )
+    await update.message.reply_text(msg)
+
+
+# =========================
+# CORE ROUTING (text/voice)
+# =========================
+async def route_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, text: str):
+    """
+    Single routing function for both TEXT and VOICE transcripts.
+    """
+    lang = get_lang(user_id)
+    text = (text or "").strip()
+
+    mark_debug(user_id, f"route_user_text: lang={lang}, in_lead={user_id in lead_states}, text='{text[:120]}'")
+
+    # Anti-spam check FIRST (avoid OpenAI burn)
+    ignore, reply = anti_spam_check(user_id, text)
+    if ignore:
+        if reply:
+            await update.message.reply_text(reply, reply_markup=mk_main_keyboard(lang))
+        return
+
+    # Lead form step processing priority
     if user_id in lead_states:
-        handled = await handle_lead_form(update, context)
+        handled = await handle_lead_form_text(user_id, update, context, text)
         if handled:
             return
 
@@ -513,14 +912,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_lead_form(update, context)
         return
 
-    # Contacts (static)
+    # Contacts (static) -> Lead-mode for short guidance
     if is_contacts_button(text):
         await update.message.reply_text(TEXTS[lang]["contacts_text"], reply_markup=mk_main_keyboard(lang))
         return
 
-    # Otherwise -> assistant
+    # If pressed a menu button like "What/Price/Payback/Franchise"
+    prompt = button_to_prompt(lang, text)
+    if prompt:
+        # Treat as KB_ONLY but with explicit topic
+        try:
+            ai_reply = await ask_assistant(user_id, prompt, mode="KB_ONLY")
+            if not ai_reply:
+                await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
+                return
+            await update.message.reply_text(ai_reply, reply_markup=mk_main_keyboard(lang))
+            return
+        except Exception as e:
+            print("ASSISTANT ERROR:", repr(e))
+            await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
+            return
+
+    # Otherwise free-text -> KB_ONLY
     try:
-        ai_reply = await ask_assistant(user_id, text)
+        ai_reply = await ask_assistant(user_id, text, mode="KB_ONLY")
         if not ai_reply:
             await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
             return
@@ -529,12 +944,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("ASSISTANT ERROR:", repr(e))
         await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
 
+
+# =========================
+# TEXT HANDLER
+# =========================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    # default UA
+    if user_id not in user_lang:
+        user_lang[user_id] = "ua"
+
+    # banned?
+    if user_is_banned(user_id):
+        await update.message.reply_text(t(user_id, "banned_msg"), reply_markup=mk_main_keyboard(get_lang(user_id)))
+        return
+
+    text = (update.message.text or "").strip()
+    await route_user_text(update, context, user_id, text)
+
+
 # =========================
 # VOICE HANDLER
 # =========================
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+
+    if user_id not in user_lang:
+        user_lang[user_id] = "ua"
+
     lang = get_lang(user_id)
+
+    # banned?
+    if user_is_banned(user_id):
+        await update.message.reply_text(TEXTS[lang]["banned_msg"], reply_markup=mk_main_keyboard(lang))
+        return
 
     try:
         voice = update.message.voice
@@ -549,30 +993,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model="gpt-4o-mini-transcribe",
             file=buf,
         )
-        user_text = (transcript.text or "").strip()
+        user_text = (getattr(transcript, "text", "") or "").strip()
 
         if not user_text:
             await update.message.reply_text(TEXTS[lang]["voice_fail"], reply_markup=mk_main_keyboard(lang))
             return
 
-        # Если пользователь был в лид-форме — считаем транскрипт как ввод в лид-форму
-        if user_id in lead_states:
-            # Подменяем текст и обрабатываем как текст
-            update.message.text = user_text
-            await handle_message(update, context)
-            return
+        mark_debug(user_id, f"voice_transcript: '{user_text[:200]}'")
 
-        # обычный поток: отправляем транскрипт в ассистент
-        ai_reply = await ask_assistant(user_id, user_text)
-        if not ai_reply:
-            await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
-            return
-
-        await update.message.reply_text(ai_reply, reply_markup=mk_main_keyboard(lang))
+        # Route transcript through the same pipeline (anti-spam included)
+        await route_user_text(update, context, user_id, user_text)
 
     except Exception as e:
         print("VOICE ERROR:", repr(e))
         await update.message.reply_text(TEXTS[lang]["generic_error"], reply_markup=mk_main_keyboard(lang))
+
 
 # =========================
 # ENTRYPOINT
@@ -582,13 +1017,26 @@ def main():
 
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # user
     application.add_handler(CommandHandler("start", start))
 
-    # voice must be BEFORE generic text (not strictly required, но так надежнее)
+    # admin
+    application.add_handler(CommandHandler("status", admin_status))
+    application.add_handler(CommandHandler("debug", admin_debug))
+    application.add_handler(CommandHandler("setlang", admin_setlang))
+    application.add_handler(CommandHandler("ban", admin_ban))
+    application.add_handler(CommandHandler("unban", admin_unban))
+    application.add_handler(CommandHandler("limits", admin_limits))
+
+    # voice before text
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    application.run_polling()
+    # IMPORTANT:
+    # drop_pending_updates helps avoid old queued updates after restarts
+    # (but it does NOT solve Conflict if two instances are running).
+    application.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
