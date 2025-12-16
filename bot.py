@@ -1,130 +1,90 @@
-import os
-import asyncio
-from dotenv import load_dotenv
+message.text
+        lead_states[uid] = "message"
+        await update.message.reply_text("Коротко опишите ваш запрос")
+    elif state == "message":
+        lead_data[uid]["message"] = update.message.text
+        lead_states.pop(uid)
 
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+        text = (
+            f"🔔 Новый лид Maison de Café\n\n"
+            f"Имя: {lead_data[uid]['name']}\n"
+            f"Телефон: {lead_data[uid]['phone']}\n"
+            f"Email: {lead_data[uid]['email']}\n"
+            f"Сообщение: {lead_data[uid]['message']}"
+        )
 
-from openai import OpenAI
+        if OWNER_TELEGRAM_ID:
+            await context.bot.send_message(chat_id=OWNER_TELEGRAM_ID, text=text)
 
-# ====== ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ======
-load_dotenv()
+        await update.message.reply_text(
+            "Спасибо! Менеджер свяжется с вами в течение 24 часов.",
+            reply_markup=MAIN_KEYBOARD,
+        )
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY не задан в переменных окружения")
-if not ASSISTANT_ID:
-    raise RuntimeError("ASSISTANT_ID не задан в переменных окружения")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# У каждого пользователя свой thread в ассистенте
-user_threads: dict[str, str] = {}
-
-# ====== КЛАВИАТУРА БОТА ======
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["Что такое Maison de Café?", "Сколько стоит открыть кофейню?"],
-        ["Окупаемость и прибыль", "Помощь с выбором локации"],
-        ["Условия франшизы", "Контакты / связь с владельцем"],
-    ],
-    resize_keyboard=True
-)
-
-# ====== ХЭНДЛЕР КОМАНДЫ /start ======
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ====== ТЕКСТ ======
+async def process_text(update, context, text):
     user_id = str(update.effective_user.id)
 
-    # создаём новый thread для пользователя
-    thread = client.beta.threads.create()
-    user_threads[user_id] = thread.id
+    if user_id not in user_languages:
+        await update.message.reply_text(
+            "Пожалуйста, выберите язык:",
+            reply_markup=LANGUAGE_KEYBOARD,
+        )
+        return
 
-    welcome_text = (
-        "Привет! 👋\n"
-        "Я — официальный ассистент Maison de Café.\n\n"
-        "Отвечаю на вопросы о:\n"
-        "• запуске кофейни самообслуживания\n"
-        "• стоимости комплекта и оборудования\n"
-        "• окупаемости и прибыли\n"
-        "• франшизе и поддержке от Maison de Café\n\n"
-        "Выбери вопрос ниже или напиши свой:"
-    )
+    if "контакт" in text.lower():
+        await update.message.reply_text(CONTACT_TEXT)
+        return
 
-    await update.message.reply_text(welcome_text, reply_markup=MAIN_KEYBOARD)
-
-# ====== ОБРАБОТКА ЛЮБОГО ТЕКСТОВОГО СООБЩЕНИЯ ======
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    user_text = update.message.text
-
-    # если у этого пользователя ещё нет thread — создаём
-    if user_id not in user_threads:
-        thread = client.beta.threads.create()
-        user_threads[user_id] = thread.id
+    if "заявк" in text.lower():
+        await start_lead(update, context)
+        return
 
     thread_id = user_threads[user_id]
 
-    # отправляем сообщение пользователя ассистенту
     client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
-        content=user_text,
+        content=text,
     )
 
-    # запускаем run ассистента
     run = client.beta.threads.runs.create(
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
     )
 
-    # ждём, пока ассистент закончит думать
     while True:
-        run_status = client.beta.threads.runs.retrieve(
-            thread_id=thread_id,
-            run_id=run.id,
-        )
-        if run_status.status == "completed":
+        status = client.beta.threads.runs.retrieve(thread_id, run.id)
+        if status.status == "completed":
             break
-        elif run_status.status in ["failed", "cancelled", "expired"]:
-            await update.message.reply_text("⚠️ Произошла ошибка при обработке запроса. Попробуйте ещё раз.")
-            return
         await asyncio.sleep(1)
 
-    # забираем последний ответ ассистента
     messages = client.beta.threads.messages.list(thread_id=thread_id)
-    if not messages.data:
-        await update.message.reply_text("⚠️ Не удалось получить ответ. Попробуйте ещё раз.")
+    reply = messages.data[0].content[0].text.value
+
+    await update.message.reply_text(reply, reply_markup=MAIN_KEYBOARD)
+
+# ====== ROUTER ======
+async def handle_text(update, context):
+    if await handle_language(update, context):
         return
 
-    # последний (самый свежий) ответ
-    ai_reply = messages.data[0].content[0].text.value
+    uid = update.effective_user.id
+    if uid in lead_states:
+        await handle_lead(update, context)
+        return
 
-    await update.message.reply_text(ai_reply, reply_markup=MAIN_KEYBOARD)
+    await process_text(update, context, update.message.text)
 
-# ====== ТОЧКА ВХОДА ======
+# ====== MAIN ======
 def main():
-    print("🚀 Бот запускается...")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # /start
-    application.add_handler(CommandHandler("start", start))
-    # любой текст
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 
-    application.run_polling()
-
-
-if __name__ == "__main__":
+if name == "__main__":
     main()
