@@ -151,9 +151,10 @@ TEXTS = {
         ),
         "voice_fail": "Не вдалося розпізнати голос. Спробуйте ще раз.",
         "generic_error": "⚠️ Сталася помилка. Спробуйте ще раз.",
+        # ВАЖНО: убрали «не знайшов у базі» — делаем человеческий fallback
         "kb_missing": (
-            "Я не знайшов цього у базі знань Maison de Café.\n"
-            "Щоб відповісти точно — залиште, будь ласка, заявку, і менеджер допоможе."
+            "Я зрозумів ваш запит. Щоб відповісти максимально точно, мені потрібно 1–2 уточнення.\n"
+            "Напишіть, будь ласка, що саме вас цікавить (місто/локація/бюджет/кількість точок), або натисніть «Залишити заявку» — і менеджер допоможе."
         ),
         "spam_stop": "⚠️ Схоже на спам. Я тимчасово не відповідаю на такі повідомлення.",
         "no_files": "Зараз я не приймаю файли/фото/документи. Напишіть питання текстом або голосом.",
@@ -184,9 +185,10 @@ TEXTS = {
         ),
         "voice_fail": "Не удалось распознать голос. Попробуйте ещё раз.",
         "generic_error": "⚠️ Произошла ошибка. Попробуйте ещё раз.",
+        # ВАЖНО: убрали «не нашёл в базе» — делаем человеческий fallback
         "kb_missing": (
-            "Я не нашёл этого в базе знаний Maison de Café.\n"
-            "Чтобы ответить точно — оставьте, пожалуйста, заявку, и менеджер поможет."
+            "Понял ваш вопрос. Чтобы ответить максимально точно, нужно 1–2 уточнения.\n"
+            "Напишите, пожалуйста, детали (город/локация/бюджет/сколько точек), либо нажмите «Оставить заявку» — и менеджер поможет."
         ),
         "spam_stop": "⚠️ Похоже на спам. Я временно не отвечаю на такие сообщения.",
         "no_files": "Сейчас я не принимаю файлы/фото/документы. Напишите вопрос текстом или голосом.",
@@ -215,8 +217,8 @@ TEXTS = {
         "voice_fail": "I couldn't understand the voice message. Please try again.",
         "generic_error": "⚠️ Something went wrong. Please try again.",
         "kb_missing": (
-            "I couldn’t find this in the Maison de Café knowledge base.\n"
-            "To answer accurately, please leave a request and a manager will help you."
+            "Got it. To answer as accurately as possible, I need 1–2 quick clarifications.\n"
+            "Please share a few details (city/location/budget/how many points), or tap “Leave a request” and a manager will help."
         ),
         "spam_stop": "⚠️ This looks like spam. I’m temporarily not responding to such messages.",
         "no_files": "Currently I don’t accept files/photos/documents. Please ask by text or voice.",
@@ -245,8 +247,8 @@ TEXTS = {
         "voice_fail": "Je n’ai pas pu comprendre le message vocal. Réessayez.",
         "generic_error": "⚠️ Une erreur est survenue. Réessayez.",
         "kb_missing": (
-            "Je n’ai pas trouvé cela dans la base de connaissances Maison de Café.\n"
-            "Pour répondre précisément, laissez une demande et un manager vous aidera."
+            "J’ai compris votre demande. Pour répondre au plus juste, il me manque 1–2 précisions.\n"
+            "Pouvez-vous indiquer quelques détails (ville/emplacement/budget/nombre de points), ou cliquer « Laisser une demande » ?"
         ),
         "spam_stop": "⚠️ Cela ressemble à du spam. Je ne réponds temporairement pas à ce type de messages.",
         "no_files": "Je n’accepte pas les fichiers/photos/documents pour le moment. Posez la question par texte ou voix.",
@@ -275,8 +277,8 @@ TEXTS = {
         "voice_fail": "Ik kon het spraakbericht niet begrijpen. Probeer het opnieuw.",
         "generic_error": "⚠️ Er ging iets mis. Probeer het opnieuw.",
         "kb_missing": (
-            "Ik kon dit niet vinden in de Maison de Café kennisbank.\n"
-            "Voor een exact antwoord: laat een aanvraag achter en een manager helpt je."
+            "Begrepen. Om zo precies mogelijk te antwoorden heb ik 1–2 korte verduidelijkingen nodig.\n"
+            "Deel a.u.b. details (stad/locatie/budget/aantal punten), of klik “Aanvraag achterlaten”."
         ),
         "spam_stop": "⚠️ Dit lijkt op spam. Ik reageer tijdelijk niet op dit soort berichten.",
         "no_files": "Ik accepteer nu geen bestanden/foto’s/documenten. Stel je vraag via tekst of spraak.",
@@ -432,7 +434,7 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_
 
 
 # =========================
-# LEAD FORM FLOW
+# LEAD FORM FLOW (НЕ ТРОГАЕМ, как договорились)
 # =========================
 async def start_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -563,8 +565,9 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     blocked_users.discard(str(context.args[0]))
     await update.message.reply_text("✅ Unblocked.")
 
+
 # =========================
-# STRICT KB ASSISTANT
+# STRICT KB ASSISTANT (BUTTONS)
 # =========================
 
 # Командные промпты для кнопок (строго “что именно нужно ответить”)
@@ -620,58 +623,127 @@ BUTTON_PROMPTS = {
     },
 }
 
-# Глобальные строгие инструкции “только из KB”
+# Глобальные строгие инструкции “только из KB” ДЛЯ КНОПОК
 STRICT_KB_RULES = {
     "ua": (
         "Ти — Макс, помічник Maison de Café. "
         "КРИТИЧНО: відповідай ЛИШЕ використовуючи базу знань Maison de Café, яка підключена до цього Assistant. "
-        "НЕ вигадуй, НЕ узагальнюй, НЕ додумуй. "
-        "Якщо в базі немає відповіді — скажи дослівно, що не знайшов у базі знань, і запропонуй залишити заявку. "
-        "Відповідай українською."
+        "НЕ вигадуй і НЕ підміняй Maison de Café іншими бізнес-моделями (звичайна кав'ярня не підходить). "
+        "Якщо даних недостатньо — постав 1–2 уточнюючі питання і запропонуй залишити заявку. "
+        "Відповідай українською. "
+        "Якщо є розрахунки — рахуй чітко й прозоро."
     ),
     "ru": (
         "Ты — Макс, помощник Maison de Café. "
         "КРИТИЧНО: отвечай ТОЛЬКО используя базу знаний Maison de Café, подключенную к этому Assistant. "
-        "НЕ выдумывай, НЕ обобщай, НЕ додумывай. "
-        "Если в базе нет ответа — скажи, что не нашёл в базе знаний, и предложи оставить заявку. "
-        "Отвечай на русском."
+        "НЕ выдумывай и НЕ подменяй Maison de Café другими бизнес-моделями (обычная стационарная кофейня не подходит). "
+        "Если данных недостаточно — задай 1–2 уточняющих вопроса и предложи оставить заявку. "
+        "Отвечай на русском. "
+        "Если есть расчёты — считай чётко и прозрачно."
     ),
     "en": (
         "You are Max, Maison de Café assistant. "
         "CRITICAL: answer ONLY using the Maison de Café knowledge base connected to this Assistant. "
-        "Do NOT invent, do NOT generalize, do NOT guess. "
-        "If the KB does not contain the answer, say you couldn’t find it in the Maison de Café knowledge base and suggest leaving a request. "
-        "Answer in English."
+        "Do NOT invent and do NOT replace Maison de Café with generic coffee shop advice. "
+        "If details are missing, ask 1–2 clarifying questions and suggest leaving a request. "
+        "Answer in English. "
+        "For math questions, calculate clearly and transparently."
     ),
     "fr": (
         "Tu es Max, assistant de Maison de Café. "
         "CRITIQUE : réponds UNIQUEMENT à partir de la base de connaissances Maison de Café connectée à cet Assistant. "
-        "N’invente pas, ne généralise pas, ne devine pas. "
-        "Si la base ne contient pas la réponse, dis que tu ne l’as pas trouvée dans la base Maison de Café et propose de laisser une demande. "
-        "Réponds en français."
+        "N’invente pas et ne remplace pas Maison de Café par des conseils génériques pour une caféterie classique. "
+        "S’il manque des détails, pose 1–2 questions de clarification et propose de laisser une demande. "
+        "Réponds en français. "
+        "Pour les calculs, calcule clairement."
     ),
     "nl": (
         "Je bent Max, assistent van Maison de Café. "
         "KRITISCH: antwoord ALLEEN met informatie uit de Maison de Café kennisbank die aan deze Assistant is gekoppeld. "
-        "Niet verzinnen, niet generaliseren, niet gokken. "
-        "Als het niet in de kennisbank staat, zeg dat je het niet kon vinden en stel voor om een aanvraag achter te laten. "
-        "Antwoord in het Nederlands."
+        "Niet verzinnen en geen generiek advies voor een gewone koffiebar geven. "
+        "Als details ontbreken, stel 1–2 verduidelijkingsvragen en stel voor om een aanvraag achter te laten. "
+        "Antwoord in het Nederlands. "
+        "Bij berekeningen: reken duidelijk."
+    ),
+}
+
+# =========================
+# HUMAN CONSULTANT MODE (FREE TEXT)
+# =========================
+# Максимально человеческий тон + строго про Maison de Café + опора на KB
+HUMAN_CONSULTANT_RULES = {
+    "ua": (
+        "Ти — Макс, живий консультант Maison de Café (проєкт кавових точок самообслуговування). "
+        "Ти спілкуєшся по-людськи: спокійно, впевнено, доброзичливо, без сухих фраз. "
+        "Ти відповідаєш проєктно і по суті, як менеджер з продажів/консультант. "
+        "КРИТИЧНО: не підміняй Maison de Café порадами про «звичайну кав'ярню». "
+        "КРИТИЧНО: не вигадуй фактів і цифр. Спирайся на базу знань Maison de Café, підключену до цього Assistant. "
+        "Якщо питання про математику/окупність — рахуй чітко і прозоро. "
+        "Якщо даних недостатньо, не кажи «я не знайшов у базі» — "
+        "замість цього постав 1–2 уточнення і запропонуй залишити заявку, щоб менеджер підтвердив деталі."
+    ),
+    "ru": (
+        "Ты — Макс, живой консультант Maison de Café (кофейные точки самообслуживания). "
+        "Ты говоришь по-человечески: спокойно, уверенно, доброжелательно. "
+        "Ты отвечаешь как консультант/продажи и ведёшь к следующему шагу. "
+        "КРИТИЧНО: не подменяй Maison de Café советами про «обычную кофейню». "
+        "КРИТИЧНО: не выдумывай факты и цифры. Опирайся на базу знаний Maison de Café, подключённую к этому Assistant. "
+        "Если вопрос про математику/окупаемость — считай чётко и прозрачно. "
+        "Если данных не хватает, не говори «я не нашёл в базе» — "
+        "задай 1–2 уточнения и предложи оставить заявку, чтобы менеджер подтвердил детали."
+    ),
+    "en": (
+        "You are Max, a human consultant for Maison de Café (self-service coffee points). "
+        "You speak in a calm, confident, friendly, human way (not robotic). "
+        "You answer as a sales/launch consultant and guide to the next step. "
+        "CRITICAL: do not replace Maison de Café with generic coffee shop advice. "
+        "CRITICAL: do not invent facts or numbers. Rely on the Maison de Café knowledge base connected to this Assistant. "
+        "For math/payback questions, calculate clearly and transparently. "
+        "If details are missing, do NOT say 'I couldn’t find it in the KB' — "
+        "ask 1–2 clarifying questions and suggest leaving a request so a manager can confirm specifics."
+    ),
+    "fr": (
+        "Tu es Max, consultant humain de Maison de Café (points café en libre-service). "
+        "Tu parles de façon calme, confiante et naturelle. "
+        "Tu réponds comme un consultant commercial et tu guides vers l’étape suivante. "
+        "CRITIQUE : ne remplace pas Maison de Café par des conseils génériques pour une caféterie classique. "
+        "CRITIQUE : n’invente pas de faits ni de chiffres. Appuie-toi sur la base de connaissances Maison de Café connectée à cet Assistant. "
+        "Pour les calculs/rentabilité, calcule clairement. "
+        "S’il manque des détails, ne dis pas 'je n’ai pas trouvé' — "
+        "pose 1–2 questions et propose de laisser une demande."
+    ),
+    "nl": (
+        "Je bent Max, een menselijke consultant van Maison de Café (zelfbedieningskoffiepunten). "
+        "Je communiceert rustig, zelfverzekerd en vriendelijk (niet robotachtig). "
+        "Je antwoordt als sales/launch-consultant en stuurt naar de volgende stap. "
+        "KRITISCH: vervang Maison de Café niet door algemeen advies voor een gewone koffiebar. "
+        "KRITISCH: verzin geen feiten of cijfers. Gebruik de Maison de Café kennisbank die aan deze Assistant is gekoppeld. "
+        "Voor winst/terugverdientijd: reken duidelijk en transparant. "
+        "Als details ontbreken, zeg niet 'niet gevonden' — "
+        "stel 1–2 verduidelijkingsvragen en stel voor om een aanvraag achter te laten."
     ),
 }
 
 
 def build_instructions(lang: str, action_key: Optional[str] = None) -> str:
-    base = STRICT_KB_RULES.get(lang, STRICT_KB_RULES["ua"])
+    """
+    КНОПКИ: строгий режим (KB-only) + TASK по BUTTON_PROMPTS
+    ТЕКСТ: человеческий консультант (KB-based, без выдумок, без фразы 'не нашёл')
+    """
+    # КНОПКИ = строгий режим
     if action_key and action_key in BUTTON_PROMPTS:
-        return base + "\n\n" + "TASK:\n" + BUTTON_PROMPTS[action_key][lang]
-    return base
+        base = STRICT_KB_RULES.get(lang, STRICT_KB_RULES["ua"])
+        return base + "\n\nTASK:\n" + BUTTON_PROMPTS[action_key][lang]
+
+    # СВОБОДНЫЙ ДИАЛОГ = человеческий режим
+    return HUMAN_CONSULTANT_RULES.get(lang, HUMAN_CONSULTANT_RULES["ua"])
 
 
 async def ask_assistant_strict(user_id: str, lang: str, user_text: str, action_key: Optional[str] = None) -> str:
     """
     Всегда:
     - thread = (user_id, lang) чтобы контекст не мешал языкам
-    - instructions = строгие KB + язык + (если кнопка) task
+    - instructions = строгие KB (для кнопок) или human consultant (для текста)
     """
     thread_id = ensure_thread(user_id, lang)
 
@@ -704,32 +776,30 @@ async def ask_assistant_strict(user_id: str, lang: str, user_text: str, action_k
 
 def looks_like_kb_missing(ai_reply: str, lang: str) -> bool:
     """
-    Доп.страховка: если ассистент “поплыл” и пишет общие вещи,
-    мы можем принудительно вернуть kb_missing.
-    (Условия мягкие, чтобы не ломать нормальные ответы.)
+    Мягкая страховка: мы больше НЕ режем «человечные» ответы.
+    Возвращаем True только если:
+    - ответ пустой
+    - или ассистент явно пишет 'не нашёл/не найдено'
     """
     if not ai_reply:
         return True
+
     low = ai_reply.strip().lower()
 
-    # типичные признаки "я не знаю/вот общие советы" (на разных языках)
-    generic_markers = [
-        "i recommend", "generally", "in general", "typically",
-        "je recommande", "en général",
-        "ik raad aan", "over het algemeen",
-        "рекомендую", "в целом", "обычно",
-        "рекомендую", "загалом", "зазвичай",
+    hard_fail_markers = [
+        "я не знайшов",
+        "я не нашел",
+        "не нашёл",
+        "i couldn’t find",
+        "i could not find",
+        "not found in the",
+        "je n’ai pas trouvé",
+        "je n'ai pas trouvé",
+        "pas trouvé dans",
+        "ik kon het niet vinden",
+        "niet gevonden in",
     ]
-    # если ассистент начинает давать “общие советы” — считаем это нарушением строгого режима
-    if any(m in low for m in generic_markers):
-        return True
-
-    # если слишком длинное “полотно” — тоже режем (не ограничение, а качество):
-    # Полотно обычно = ассистент фантазирует. Лучше вернуть kb_missing.
-    if len(ai_reply) > 2400:
-        return True
-
-    return False
+    return any(m in low for m in hard_fail_markers)
 
 
 # =========================
@@ -739,8 +809,6 @@ async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     lang = get_lang(user_id)
     await update.message.reply_text(TEXTS[lang]["no_files"], reply_markup=mk_main_keyboard(lang))
-
-
 # =========================
 # VOICE HANDLER
 # =========================
@@ -783,7 +851,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if handled:
                 return
 
-        # иначе — строгий ассистент
+        # иначе — ассистент (human mode for free text)
         ai_reply = await ask_assistant_strict(user_id=user_id, lang=lang, user_text=user_text, action_key=None)
 
         if looks_like_kb_missing(ai_reply, lang):
@@ -839,7 +907,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(TEXTS[lang]["contacts_text"], reply_markup=mk_main_keyboard(lang))
         return
 
-    # Лид-форма — локальная логика
+    # Лид-форма — локальная логика (мы её не меняем)
     if is_lead_button(text):
         await start_lead_form(update, context)
         return
@@ -851,8 +919,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ЖЁСТКО: язык = язык кнопки
         user_lang[user_id] = button_lang
 
-        # Текст для ассистента — в виде команды (а не “просто текст кнопки”)
-        # Это исключает “размытые ответы”.
+        # Текст для ассистента — команда (не просто текст кнопки)
         command_text = f"[BUTTON:{action_key}] {MENU[button_lang][action_key]}"
 
         ai_reply = await ask_assistant_strict(
@@ -869,8 +936,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(ai_reply, reply_markup=mk_main_keyboard(button_lang))
         return
 
-    # Иначе: это обычный вопрос пользователя.
-    # Язык ответа = текущий выбранный язык пользователя.
+    # Иначе: это обычный вопрос пользователя (human consultant mode).
     lang = get_lang(user_id)
     try:
         ai_reply = await ask_assistant_strict(user_id=user_id, lang=lang, user_text=text, action_key=None)
