@@ -1,3 +1,395 @@
+import os
+import io
+import re
+import time
+import asyncio
+import smtplib
+from datetime import datetime
+from email.mime.text import MIMEText
+from typing import Dict, Optional, Tuple, Set, List
+
+from dotenv import load_dotenv
+
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from openai import OpenAI
+
+
+# =========================
+# ENV
+# =========================
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+
+OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID")  # обязательный для уведомлений владельцу
+LEAD_EMAIL_TO = os.getenv("LEAD_EMAIL_TO", "maisondecafe.coffee@gmail.com")
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = os.getenv("SMTP_PORT")
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY не задан в переменных окружения")
+if not ASSISTANT_ID:
+    raise RuntimeError("ASSISTANT_ID не задан в переменных окружения")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# =========================
+# STATE (IN-MEMORY)
+# =========================
+# (user_id, lang) -> thread_id
+user_threads: Dict[Tuple[str, str], str] = {}
+
+# user_id -> selected lang (ua/ru/en/fr/nl)
+user_lang: Dict[str, str] = {}
+
+# Lead form state
+lead_states: Dict[str, str] = {}                # user_id -> step
+lead_data: Dict[str, Dict[str, str]] = {}       # user_id -> collected fields
+
+# Anti-spam
+user_rate: Dict[str, list] = {}                 # user_id -> timestamps
+blocked_users: Set[str] = set()                 # user_id blocked
+
+
+# =========================
+# I18N (texts + buttons)
+# =========================
+LANGS = ["ua", "ru", "en", "fr", "nl"]
+
+LANG_LABELS = {
+    "ua": "🇺🇦 Українська",
+    "ru": "🇷🇺 Русский",
+    "en": "🇬🇧 English",
+    "fr": "🇫🇷 Français",
+    "nl": "🇳🇱 Nederlands",
+}
+
+MENU = {
+    "ua": {
+        "what": "☕ Що таке Maison de Café?",
+        "price": "💶 Скільки коштує відкрити кав’ярню?",
+        "payback": "📈 Окупність і прибуток",
+        "franchise": "🤝 Умови франшизи",
+        "contacts": "📞 Контакти / зв’язок з власником",
+        "lead": "📝 Залишити заявку",
+        "lang": "🌍 Мова / Language",
+    },
+    "ru": {
+        "what": "☕ Что такое Maison de Café?",
+        "price": "💶 Сколько стоит открыть кофейню?",
+        "payback": "📈 Окупаемость и прибыль",
+        "franchise": "🤝 Условия франшизы",
+        "contacts": "📞 Контакты / связь с владельцем",
+        "lead": "📝 Оставить заявку",
+        "lang": "🌍 Язык / Language",
+    },
+    "en": {
+        "what": "☕ What is Maison de Café?",
+        "price": "💶 How much does it cost to open a coffee point?",
+        "payback": "📈 Payback & profit",
+        "franchise": "🤝 Franchise terms",
+        "contacts": "📞 Contacts / owner",
+        "lead": "📝 Leave a request",
+        "lang": "🌍 Language",
+    },
+    "fr": {
+        "what": "☕ Qu’est-ce que Maison de Café ?",
+        "price": "💶 Combien coûte l’ouverture ?",
+        "payback": "📈 Rentabilité & profit",
+        "franchise": "🤝 Conditions de franchise",
+        "contacts": "📞 Contacts / propriétaire",
+        "lead": "📝 Laisser une demande",
+        "lang": "🌍 Langue / Language",
+    },
+    "nl": {
+        "what": "☕ Wat is Maison de Café?",
+        "price": "💶 Wat kost het om te starten?",
+        "payback": "📈 Terugverdientijd & winst",
+        "franchise": "🤝 Franchisevoorwaarden",
+        "contacts": "📞 Contact / eigenaar",
+        "lead": "📝 Aanvraag achterlaten",
+        "lang": "🌍 Taal / Language",
+    },
+}
+
+TEXTS = {
+    "ua": {
+        "welcome": (
+            "Добрий день!\n"
+            "Мене звати Макс, я віртуальний помічник компанії Maison de Café.\n"
+            "Я допоможу вам розібратися у питаннях про наші кав’ярні самообслуговування, запуск і умови співпраці.\n"
+            "Оберіть, будь ласка, кнопку з меню або задайте питання."
+        ),
+        "choose_lang": "🌍 Оберіть мову:",
+        "lang_set": "✅ Мову змінено: {lang}.",
+        "lead_start": "📝 Залишити заявку.\n\nКрок 1/4: Напишіть ваше ім’я та прізвище.",
+        "lead_phone": "Крок 2/4: Напишіть ваш номер телефону.",
+        "lead_email": "Крок 3/4: Напишіть ваш email.",
+        "lead_msg": "Крок 4/4: Коротко опишіть ваш запит (1–2 речення).",
+        "lead_done": (
+            "Дякуємо! Заявку відправлено. Менеджер зв’яжеться з вами протягом 24 годин.\n\n{email_note}"
+        ),
+        "voice_fail": "Не вдалося розпізнати голос. Спробуйте ще раз.",
+        "generic_error": "⚠️ Сталася помилка. Спробуйте ще раз.",
+        "kb_missing": (
+            "Я не знайшов цього у базі знань Maison de Café.\n"
+            "Щоб відповісти точно — залиште, будь ласка, заявку, і менеджер допоможе."
+        ),
+        "spam_stop": "⚠️ Схоже на спам. Я тимчасово не відповідаю на такі повідомлення.",
+        "no_files": "Зараз я не приймаю файли/фото/документи. Напишіть питання текстом або голосом.",
+        "contacts_text": (
+            "Зв’язатися з Maison de Café можна так:\n\n"
+            "• Email: maisondecafe.coffee@gmail.com\n"
+            "• Телефон: +32 470 600 806\n"
+            "• Telegram-канал: https://t.me/maisondecafe\n\n"
+            "Якщо хочете — натисніть «Залишити заявку», і менеджер зв’яжеться з вами протягом 24 годин."
+        ),
+    },
+    "ru": {
+        "welcome": (
+            "Добрый день!\n"
+            "Меня зовут Макс, я виртуальный помощник компании Maison de Café.\n"
+            "Помогу с вопросами про формат кофепоинтов самообслуживания, запуск и условия сотрудничества.\n"
+            "Выберите кнопку меню или задайте вопрос."
+        ),
+        "choose_lang": "🌍 Выберите язык:",
+        "lang_set": "✅ Язык установлен: {lang}.",
+        "lead_start": "📝 Оставить заявку.\n\nШаг 1/4: Напишите ваше имя и фамилию.",
+        "lead_phone": "Шаг 2/4: Напишите ваш номер телефона.",
+        "lead_email": "Шаг 3/4: Напишите ваш email.",
+        "lead_msg": "Шаг 4/4: Коротко опишите запрос (1–2 предложения).",
+        "lead_done": (
+            "Спасибо! Заявка отправлена. Менеджер свяжется с вами в течение 24 часов.\n\n{email_note}"
+        ),
+        "voice_fail": "Не удалось распознать голос. Попробуйте ещё раз.",
+        "generic_error": "⚠️ Произошла ошибка. Попробуйте ещё раз.",
+        "kb_missing": (
+            "Я не нашёл этого в базе знаний Maison de Café.\n"
+            "Чтобы ответить точно — оставьте, пожалуйста, заявку, и менеджер поможет."
+        ),
+        "spam_stop": "⚠️ Похоже на спам. Я временно не отвечаю на такие сообщения.",
+        "no_files": "Сейчас я не принимаю файлы/фото/документы. Напишите вопрос текстом или голосом.",
+        "contacts_text": (
+            "Связаться с Maison de Café можно так:\n\n"
+            "• Email: maisondecafe.coffee@gmail.com\n"
+            "• Телефон: +32 470 600 806\n"
+            "• Telegram-канал: https://t.me/maisondecafe\n\n"
+            "Если хотите — нажмите «Оставить заявку», и менеджер свяжется с вами в течение 24 часов."
+        ),
+    },
+    "en": {
+        "welcome": (
+            "Hello!\n"
+            "I’m Max, Maison de Café virtual assistant.\n"
+            "Ask a question or use the menu buttons below."
+        ),
+        "choose_lang": "🌍 Choose a language:",
+        "lang_set": "✅ Language set: {lang}.",
+        "lead_start": "📝 Leave a request.\n\nStep 1/4: Please type your first & last name.",
+        "lead_phone": "Step 2/4: Please type your phone number.",
+        "lead_email": "Step 3/4: Please type your email.",
+        "lead_msg": "Step 4/4: Briefly describe your request (1–2 sentences).",
+        "lead_done": "Thank you! Request sent. Our manager will contact you within 24 hours.\n\n{email_note}",
+        "voice_fail": "I couldn't understand the voice message. Please try again.",
+        "generic_error": "⚠️ Something went wrong. Please try again.",
+        "kb_missing": (
+            "I couldn’t find this in the Maison de Café knowledge base.\n"
+            "To answer accurately, please leave a request and a manager will help you."
+        ),
+        "spam_stop": "⚠️ This looks like spam. I’m temporarily not responding to such messages.",
+        "no_files": "Currently I don’t accept files/photos/documents. Please ask by text or voice.",
+        "contacts_text": (
+            "You can contact Maison de Café via:\n\n"
+            "• Email: maisondecafe.coffee@gmail.com\n"
+            "• Phone: +32 470 600 806\n"
+            "• Telegram channel: https://t.me/maisondecafe\n\n"
+            "If you want — tap “Leave a request” and a manager will contact you within 24 hours."
+        ),
+    },
+    "fr": {
+        "welcome": (
+            "Bonjour !\n"
+            "Je suis Max, assistant virtuel Maison de Café.\n"
+            "Posez une question ou utilisez le menu ci-dessous."
+        ),
+        "choose_lang": "🌍 Choisissez la langue :",
+        "lang_set": "✅ Langue sélectionnée : {lang}.",
+        "lead_start": "📝 Laisser une demande.\n\nÉtape 1/4 : votre nom et prénom.",
+        "lead_phone": "Étape 2/4 : votre numéro de téléphone.",
+        "lead_email": "Étape 3/4 : votre email.",
+        "lead_msg": "Étape 4/4 : décrivez brièvement votre demande (1–2 phrases).",
+        "lead_done": "Merci ! Demande envoyée. Un manager vous contactera sous 24h.\n\n{email_note}",
+        "voice_fail": "Je n’ai pas pu comprendre le message vocal. Réessayez.",
+        "generic_error": "⚠️ Une erreur est survenue. Réessayez.",
+        "kb_missing": (
+            "Je n’ai pas trouvé cela dans la base de connaissances Maison de Café.\n"
+            "Pour répondre précisément, laissez une demande et un manager vous aidera."
+        ),
+        "spam_stop": "⚠️ Cela ressemble à du spam. Je ne réponds temporairement pas à ce type de messages.",
+        "no_files": "Je n’accepte pas les fichiers/photos/documents pour le moment. Posez la question par texte ou voix.",
+        "contacts_text": (
+            "Vous pouvez contacter Maison de Café via :\n\n"
+            "• Email : maisondecafe.coffee@gmail.com\n"
+            "• Téléphone : +32 470 600 806\n"
+            "• Canal Telegram : https://t.me/maisondecafe\n\n"
+            "Si vous voulez — cliquez « Laisser une demande » et un manager vous contactera sous 24h."
+        ),
+    },
+    "nl": {
+        "welcome": (
+            "Hallo!\n"
+            "Ik ben Max, de virtuele assistent van Maison de Café.\n"
+            "Stel je vraag of gebruik het menu hieronder."
+        ),
+        "choose_lang": "🌍 Kies een taal:",
+        "lang_set": "✅ Taal ingesteld: {lang}.",
+        "lead_start": "📝 Aanvraag achterlaten.\n\nStap 1/4: Typ je voor- en achternaam.",
+        "lead_phone": "Stap 2/4: Typ je telefoonnummer.",
+        "lead_email": "Stap 3/4: Typ je e-mail.",
+        "lead_msg": "Stap 4/4: Beschrijf kort je vraag (1–2 zinnen).",
+        "lead_done": "Bedankt! Aanvraag verzonden. We nemen binnen 24 uur contact op.\n\n{email_note}",
+        "voice_fail": "Ik kon het spraakbericht niet begrijpen. Probeer het opnieuw.",
+        "generic_error": "⚠️ Er ging iets mis. Probeer het opnieuw.",
+        "kb_missing": (
+            "Ik kon dit niet vinden in de Maison de Café kennisbank.\n"
+            "Voor een exact antwoord: laat een aanvraag achter en een manager helpt je."
+        ),
+        "spam_stop": "⚠️ Dit lijkt op spam. Ik reageer tijdelijk niet op dit soort berichten.",
+        "no_files": "Ik accepteer nu geen bestanden/foto’s/documenten. Stel je vraag via tekst of spraak.",
+        "contacts_text": (
+            "Contact opnemen met Maison de Café kan via:\n\n"
+            "• E-mail: maisondecafe.coffee@gmail.com\n"
+            "• Telefoon: +32 470 600 806\n"
+            "• Telegram-kanaal: https://t.me/maisondecafe\n\n"
+            "Wil je — klik “Aanvraag achterlaten”, dan nemen we binnen 24 uur contact op."
+        ),
+    },
+}
+
+
+# =========================
+# BUTTON LOOKUP (per language)
+# =========================
+BUTTON_LOOKUP: Dict[str, Tuple[str, str]] = {}
+for lang in LANGS:
+    for key, label in MENU[lang].items():
+        BUTTON_LOOKUP[label] = (key, lang)
+
+
+# =========================
+# HELPERS
+# =========================
+def get_lang(user_id: str) -> str:
+    return user_lang.get(user_id, "ua")
+
+def mk_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    m = MENU[lang]
+    kb = [
+        [m["what"], m["price"]],
+        [m["payback"], m["franchise"]],
+        [m["contacts"], m["lead"]],
+        [m["lang"]],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def mk_lang_keyboard() -> ReplyKeyboardMarkup:
+    kb = [
+        [LANG_LABELS["ua"], LANG_LABELS["ru"]],
+        [LANG_LABELS["en"], LANG_LABELS["fr"]],
+        [LANG_LABELS["nl"]],
+    ]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
+
+def parse_lang_choice(text: str) -> Optional[str]:
+    for code, label in LANG_LABELS.items():
+        if (text or "").strip() == label:
+            return code
+    return None
+
+def smtp_configured() -> bool:
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and SMTP_FROM and LEAD_EMAIL_TO)
+
+def send_lead_email(subject: str, body: str) -> bool:
+    if not smtp_configured():
+        return False
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM
+        msg["To"] = LEAD_EMAIL_TO
+
+        with smtplib.SMTP(SMTP_HOST, int(SMTP_PORT)) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_FROM, [LEAD_EMAIL_TO], msg.as_string())
+        return True
+    except Exception as e:
+        print("SMTP ERROR:", repr(e))
+        return False
+
+def ensure_thread(user_id: str, lang: str) -> str:
+    key = (user_id, lang)
+    if key not in user_threads:
+        thread = client.beta.threads.create()
+        user_threads[key] = thread.id
+    return user_threads[key]
+
+def reset_threads(user_id: str):
+    for lang in list(LANGS):
+        user_threads.pop((user_id, lang), None)
+
+def is_gibberish_or_spam(text: str) -> bool:
+    if not text:
+        return False
+    s = text.strip().lower()
+    if len(s) <= 2:
+        return True
+    if re.fullmatch(r"(.)\1{6,}", s):
+        return True
+    letters = sum(ch.isalpha() for ch in s)
+    if letters <= 2 and len(s) >= 5:
+        return True
+    return False
+
+def rate_limited(user_id: str, max_per_30s: int = 8) -> bool:
+    now = time.time()
+    timestamps = user_rate.get(user_id, [])
+    timestamps = [ts for ts in timestamps if now - ts < 30]
+    timestamps.append(now)
+    user_rate[user_id] = timestamps
+    return len(timestamps) > max_per_30s
+
+def button_action_from_text(text: str) -> Optional[Tuple[str, str]]:
+    return BUTTON_LOOKUP.get((text or "").strip())
+
+def is_language_button(text: str) -> bool:
+    action = button_action_from_text(text)
+    return bool(action and action[0] == "lang")
+
+def is_lead_button(text: str) -> bool:
+    action = button_action_from_text(text)
+    return bool(action and action[0] == "lead")
+
+def is_contacts_button(text: str) -> bool:
+    action = button_action_from_text(text)
+    return bool(action and action[0] == "contacts")
 # =========================
 # HUMAN CONSULTANT + STRICT KB (CORPORATE COMPLIANCE)
 # =========================
