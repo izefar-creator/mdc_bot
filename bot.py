@@ -6,7 +6,7 @@ import asyncio
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
-from typing import Dict, Optional, Tuple, Set, List
+from typing import Dict, Optional, Tuple, Set
 
 from dotenv import load_dotenv
 
@@ -53,6 +53,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # =========================
 # STATE (IN-MEMORY)
 # =========================
+# ВАЖНО: тред отдельный на язык, чтобы English не тащил UA контекст.
 # (user_id, lang) -> thread_id
 user_threads: Dict[Tuple[str, str], str] = {}
 
@@ -60,7 +61,7 @@ user_threads: Dict[Tuple[str, str], str] = {}
 user_lang: Dict[str, str] = {}
 
 # Lead form state
-lead_states: Dict[str, str] = {}                # user_id -> step
+lead_states: Dict[str, str] = {}                # user_id -> step: name/phone/email/message
 lead_data: Dict[str, Dict[str, str]] = {}       # user_id -> collected fields
 
 # Anti-spam
@@ -81,6 +82,7 @@ LANG_LABELS = {
     "nl": "🇳🇱 Nederlands",
 }
 
+# Главное меню (кнопки) — локализовано
 MENU = {
     "ua": {
         "what": "☕ Що таке Maison de Café?",
@@ -134,8 +136,8 @@ TEXTS = {
         "welcome": (
             "Добрий день!\n"
             "Мене звати Макс, я віртуальний помічник компанії Maison de Café.\n"
-            "Я допоможу вам розібратися у питаннях про наші кав’ярні самообслуговування, запуск і умови співпраці.\n"
-            "Оберіть, будь ласка, кнопку з меню або задайте питання."
+            "Я допоможу вам розібратися у всіх питаннях, пов’язаних з нашими кав’ярнями самообслуговування, запуском і умовами співпраці.\n"
+            "Щоб продовжити, підкажіть, будь ласка, як вас звати?"
         ),
         "choose_lang": "🌍 Оберіть мову:",
         "lang_set": "✅ Мову змінено: {lang}.",
@@ -144,7 +146,8 @@ TEXTS = {
         "lead_email": "Крок 3/4: Напишіть ваш email.",
         "lead_msg": "Крок 4/4: Коротко опишіть ваш запит (1–2 речення).",
         "lead_done": (
-            "Дякуємо! Заявку відправлено. Менеджер зв’яжеться з вами протягом 24 годин.\n\n{email_note}"
+            "Дякуємо! Заявку відправлено. Наш менеджер зв’яжеться з вами протягом 24 годин.\n\n"
+            "{email_note}"
         ),
         "voice_fail": "Не вдалося розпізнати голос. Спробуйте ще раз.",
         "generic_error": "⚠️ Сталася помилка. Спробуйте ще раз.",
@@ -166,8 +169,8 @@ TEXTS = {
         "welcome": (
             "Добрый день!\n"
             "Меня зовут Макс, я виртуальный помощник компании Maison de Café.\n"
-            "Помогу с вопросами про формат кофепоинтов самообслуживания, запуск и условия сотрудничества.\n"
-            "Выберите кнопку меню или задайте вопрос."
+            "Я помогу вам разобраться во всех вопросах, связанных с нашими кофейнями самообслуживания, запуском и условиями сотрудничества.\n"
+            "Чтобы продолжить, подскажите, пожалуйста, как вас зовут?"
         ),
         "choose_lang": "🌍 Выберите язык:",
         "lang_set": "✅ Язык установлен: {lang}.",
@@ -176,7 +179,8 @@ TEXTS = {
         "lead_email": "Шаг 3/4: Напишите ваш email.",
         "lead_msg": "Шаг 4/4: Коротко опишите запрос (1–2 предложения).",
         "lead_done": (
-            "Спасибо! Заявка отправлена. Менеджер свяжется с вами в течение 24 часов.\n\n{email_note}"
+            "Спасибо! Заявка отправлена. Наш менеджер свяжется с вами в течение 24 часов.\n\n"
+            "{email_note}"
         ),
         "voice_fail": "Не удалось распознать голос. Попробуйте ещё раз.",
         "generic_error": "⚠️ Произошла ошибка. Попробуйте ещё раз.",
@@ -197,8 +201,9 @@ TEXTS = {
     "en": {
         "welcome": (
             "Hello!\n"
-            "I’m Max, Maison de Café virtual assistant.\n"
-            "Ask a question or use the menu buttons below."
+            "My name is Max, I’m the virtual assistant of Maison de Café.\n"
+            "I’ll help you with everything related to our self-service coffee points, launch costs, and partnership terms.\n"
+            "To continue, may I know your name?"
         ),
         "choose_lang": "🌍 Choose a language:",
         "lang_set": "✅ Language set: {lang}.",
@@ -226,8 +231,9 @@ TEXTS = {
     "fr": {
         "welcome": (
             "Bonjour !\n"
-            "Je suis Max, assistant virtuel Maison de Café.\n"
-            "Posez une question ou utilisez le menu ci-dessous."
+            "Je m’appelle Max, assistant virtuel de Maison de Café.\n"
+            "Je peux vous aider sur le lancement, les coûts et les conditions de partenariat.\n"
+            "Pour continuer, comment vous appelez-vous ?"
         ),
         "choose_lang": "🌍 Choisissez la langue :",
         "lang_set": "✅ Langue sélectionnée : {lang}.",
@@ -256,7 +262,8 @@ TEXTS = {
         "welcome": (
             "Hallo!\n"
             "Ik ben Max, de virtuele assistent van Maison de Café.\n"
-            "Stel je vraag of gebruik het menu hieronder."
+            "Ik help je met vragen over startkosten, winst en franchisevoorwaarden.\n"
+            "Om verder te gaan: hoe heet je?"
         ),
         "choose_lang": "🌍 Kies een taal:",
         "lang_set": "✅ Taal ingesteld: {lang}.",
@@ -283,10 +290,10 @@ TEXTS = {
     },
 }
 
-
 # =========================
 # BUTTON LOOKUP (per language)
 # =========================
+# Возвращает ("action_key", "lang_of_button") по тексту кнопки.
 BUTTON_LOOKUP: Dict[str, Tuple[str, str]] = {}
 for lang in LANGS:
     for key, label in MENU[lang].items():
@@ -297,7 +304,7 @@ for lang in LANGS:
 # HELPERS
 # =========================
 def get_lang(user_id: str) -> str:
-    return user_lang.get(user_id, "ua")
+    return user_lang.get(user_id, "ua")  # default UA
 
 def mk_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
     m = MENU[lang]
@@ -345,6 +352,7 @@ def send_lead_email(subject: str, body: str) -> bool:
         return False
 
 def ensure_thread(user_id: str, lang: str) -> str:
+    # thread будет в ЧАСТИ 2/2
     key = (user_id, lang)
     if key not in user_threads:
         thread = client.beta.threads.create()
@@ -390,181 +398,6 @@ def is_lead_button(text: str) -> bool:
 def is_contacts_button(text: str) -> bool:
     action = button_action_from_text(text)
     return bool(action and action[0] == "contacts")
-# =========================
-# HUMAN CONSULTANT + STRICT KB (CORPORATE COMPLIANCE)
-# =========================
-
-HUMAN_CONSULTANT_RULES = {
-    "ua": (
-        "ROLE: Human Consultant (Sales + Compliance).\n"
-        "TONE: людяний, коротко, структуровано, без води.\n"
-        "SCOPE: ТІЛЬКИ Maison de Café (не 'звичайна кав’ярня', не сторонні моделі).\n"
-        "COMPLIANCE: НЕ вигадувати, НЕ додумувати. Якщо факту нема в KB — kb_missing.\n"
-        "MATH: якщо питання математичне і в ньому є числа/параметри — порахуй точно, "
-        "але НЕ додавай припущень (тільки те, що дано або що є в KB).\n"
-    ),
-    "ru": (
-        "ROLE: Human Consultant (Sales + Compliance).\n"
-        "TONE: по-человечески, коротко, структурированно.\n"
-        "SCOPE: ТОЛЬКО Maison de Café (не 'обычная кофейня', не сторонние модели).\n"
-        "COMPLIANCE: НЕ выдумывать, НЕ додумывать. Если факта нет в KB — kb_missing.\n"
-        "MATH: если вопрос математический и в нём есть числа/параметры — посчитай точно, "
-        "но НЕ добавляй предположений (только дано или из KB).\n"
-    ),
-    "en": (
-        "ROLE: Human Consultant (Sales + Compliance).\n"
-        "TONE: human, concise, structured.\n"
-        "SCOPE: ONLY Maison de Café (no generic coffee shop advice).\n"
-        "COMPLIANCE: Do NOT invent or guess. If not in KB — kb_missing.\n"
-        "MATH: if the question is mathematical and includes inputs — compute accurately without assumptions.\n"
-    ),
-    "fr": (
-        "ROLE: Human Consultant (Sales + Compliance).\n"
-        "TONE: humain, concis, structuré.\n"
-        "SCOPE: UNIQUEMENT Maison de Café (pas de conseils génériques).\n"
-        "COMPLIANCE: Ne pas inventer. Si absent de la KB — kb_missing.\n"
-        "MATH: si question mathématique avec données — calcule précisément sans hypothèses.\n"
-    ),
-    "nl": (
-        "ROLE: Human Consultant (Sales + Compliance).\n"
-        "TONE: menselijk, kort, gestructureerd.\n"
-        "SCOPE: ALLEEN Maison de Café (geen algemene koffiezaak-adviezen).\n"
-        "COMPLIANCE: Niet verzinnen. Als het niet in KB staat — kb_missing.\n"
-        "MATH: als het een rekenvraag is met inputs — reken exact zonder aannames.\n"
-    ),
-}
-
-BUTTON_PROMPTS = {
-    "what": {
-        "ua": "Поясни: що таке Maison de Café. Формат, для кого, як працює, що входить у старт, що отримує партнер. Коротко.",
-        "ru": "Поясни: что такое Maison de Café. Формат, для кого, как работает, что входит в старт, что получает партнёр. Коротко.",
-        "en": "Explain what Maison de Café is: concept, for whom, how it works, what's included, what partner gets. Concise.",
-        "fr": "Explique Maison de Café : concept, pour qui, fonctionnement, inclus, ce que reçoit le partenaire. Court.",
-        "nl": "Leg Maison de Café uit: concept, voor wie, werking, inbegrepen, wat partner krijgt. Kort.",
-    },
-    "price": {
-        "ua": "Відповідай про вартість відкриття. Структура витрат + що входить/не входить. Без порад.",
-        "ru": "Ответь про стоимость открытия. Структура затрат + что входит/не входит. Без советов.",
-        "en": "Opening cost: cost structure + included/not included. No generic tips.",
-        "fr": "Coût d’ouverture : structure + inclus/non inclus. Pas de conseils généraux.",
-        "nl": "Opstartkosten: structuur + inbegrepen/niet inbegrepen. Geen algemene tips.",
-    },
-    "payback": {
-        "ua": "Окупність і прибуток. Приклад: маржа/чашка, чашок/день, 30 днів; валова маржа/міс; приклад витрат; логіка окупності.",
-        "ru": "Окупаемость и прибыль. Пример: маржа/чашка, чашек/день, 30 дней; валовая маржа/мес; пример расходов; логика окупаемости.",
-        "en": "Payback & profit. Example with margin/cup, cups/day, 30 days; gross margin/month; example costs; payback logic.",
-        "fr": "Rentabilité & profit. Exemple avec marge/tasse, tasses/jour, 30 jours; marge brute/mois; coûts; logique ROI.",
-        "nl": "Terugverdientijd & winst. Voorbeeld met marge/kop, koppen/dag, 30 dagen; brutomarge/maand; kosten; logica.",
-    },
-    "franchise": {
-        "ua": "Умови співпраці/франшизи: підтримка, стандарти, зобов’язання партнера, сервіс. Без вигадок.",
-        "ru": "Условия сотрудничества/франшизы: поддержка, стандарты, обязательства партнера, сервис. Без выдумок.",
-        "en": "Franchise/partnership terms: support, standards, partner obligations, service. No inventions.",
-        "fr": "Conditions franchise/partenariat : support, standards, obligations, service. Sans inventer.",
-        "nl": "Franchisevoorwaarden: support, standaarden, verplichtingen, service. Niet verzinnen.",
-    },
-}
-
-STRICT_KB_RULES = {
-    "ua": (
-        "КРИТИЧНО: відповідай ТІЛЬКИ з бази знань Maison de Café (File Search).\n"
-        "ПЕРЕД ВІДПОВІДДЮ: обов’язково виконай File Search мінімум 1 раз.\n"
-        "Якщо у KB нема відповіді — скажи kb_missing.\n"
-        "Відповідай українською."
-    ),
-    "ru": (
-        "КРИТИЧНО: отвечай ТОЛЬКО из базы знаний Maison de Café (File Search).\n"
-        "ПЕРЕД ОТВЕТОМ: обязательно выполни File Search минимум 1 раз.\n"
-        "Если в KB нет ответа — скажи kb_missing.\n"
-        "Отвечай по-русски."
-    ),
-    "en": (
-        "CRITICAL: answer ONLY from Maison de Café knowledge base (File Search).\n"
-        "BEFORE ANSWERING: you MUST perform File Search at least once.\n"
-        "If KB lacks the answer — say kb_missing.\n"
-        "Answer in English."
-    ),
-    "fr": (
-        "CRITIQUE : réponds UNIQUEMENT depuis la base Maison de Café (File Search).\n"
-        "AVANT DE RÉPONDRE : tu DOIS faire un File Search au moins 1 fois.\n"
-        "Si absent de la KB — kb_missing.\n"
-        "Réponds en français."
-    ),
-    "nl": (
-        "KRITISCH: antwoord ALLEEN uit de Maison de Café kennisbank (File Search).\n"
-        "VOOR JE ANTWOORD: je MOET minimaal 1x File Search gebruiken.\n"
-        "Als het niet in KB staat — kb_missing.\n"
-        "Antwoord in het Nederlands."
-    ),
-}
-
-def build_instructions(lang: str, action_key: Optional[str] = None) -> str:
-    base = (
-        HUMAN_CONSULTANT_RULES.get(lang, HUMAN_CONSULTANT_RULES["ua"])
-        + "\n"
-        + STRICT_KB_RULES.get(lang, STRICT_KB_RULES["ua"])
-    )
-    if action_key and action_key in BUTTON_PROMPTS:
-        return base + "\n\nTASK:\n" + BUTTON_PROMPTS[action_key][lang]
-    return base
-
-def run_used_file_search(thread_id: str, run_id: str) -> bool:
-    try:
-        steps = client.beta.threads.runs.steps.list(thread_id=thread_id, run_id=run_id)
-        for st in steps.data:
-            details = getattr(st, "step_details", None)
-            tool_calls = getattr(details, "tool_calls", None)
-            if not tool_calls:
-                continue
-            for tc in tool_calls:
-                # В Assistants API file_search обычно приходит как type="file_search"
-                if getattr(tc, "type", "") == "file_search":
-                    return True
-        return False
-    except Exception as e:
-        print("RUN STEPS ERROR:", repr(e))
-        return False
-
-async def ask_assistant_strict(user_id: str, lang: str, user_text: str, action_key: Optional[str] = None) -> str:
-    thread_id = ensure_thread(user_id, lang)
-
-    client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=user_text,
-    )
-
-    run = client.beta.threads.runs.create(
-        thread_id=thread_id,
-        assistant_id=ASSISTANT_ID,
-        instructions=build_instructions(lang, action_key),
-        temperature=0,
-    )
-
-    while True:
-        rs = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-        if rs.status == "completed":
-            break
-        if rs.status in ["failed", "cancelled", "expired"]:
-            return ""
-        await asyncio.sleep(0.7)
-
-    # COMPLIANCE GATE: ответ разрешён только если реально был file_search
-    if not run_used_file_search(thread_id=thread_id, run_id=run.id):
-        return "kb_missing"
-
-    messages = client.beta.threads.messages.list(thread_id=thread_id)
-    if not messages.data:
-        return ""
-
-    # Берём первое сообщение ассистента из последних
-    for msg in messages.data:
-        if getattr(msg, "role", "") == "assistant":
-            try:
-                return msg.content[0].text.value
-            except Exception:
-                continue
-    return ""
 
 
 # =========================
@@ -591,6 +424,7 @@ async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_code: str):
     user_id = str(update.effective_user.id)
     user_lang[user_id] = lang_code
+
     await update.message.reply_text(
         TEXTS[lang_code]["lang_set"].format(lang=LANG_LABELS[lang_code]),
         reply_markup=mk_main_keyboard(lang_code),
@@ -598,14 +432,18 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_
 
 
 # =========================
-# LEAD FORM FLOW (оставляем как есть)
+# LEAD FORM FLOW
 # =========================
 async def start_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     lead_states[user_id] = "name"
     lead_data[user_id] = {}
+
     lang = get_lang(user_id)
-    await update.message.reply_text(TEXTS[lang]["lead_start"], reply_markup=mk_main_keyboard(lang))
+    await update.message.reply_text(
+        TEXTS[lang]["lead_start"],
+        reply_markup=mk_main_keyboard(lang),
+    )
 
 async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = str(update.effective_user.id)
@@ -613,6 +451,7 @@ async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     step = lead_states.get(user_id)
     text = (update.message.text or "").strip()
+
     if not step:
         return False
 
@@ -644,11 +483,11 @@ async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         payload = (
             f"Telegram user_id: {user_id}\n"
             f"Username: @{username}\n"
-            f"Name: {lead_data[user_id].get('name','')}\n"
-            f"Phone: {lead_data[user_id].get('phone','')}\n"
+            f"Ім'я/Прізвище: {lead_data[user_id].get('name','')}\n"
+            f"Телефон: {lead_data[user_id].get('phone','')}\n"
             f"Email: {lead_data[user_id].get('email','')}\n"
-            f"Message: {lead_data[user_id].get('message','')}\n"
-            f"Time: {now}\n"
+            f"Повідомлення: {lead_data[user_id].get('message','')}\n"
+            f"Час: {now}\n"
         )
 
         owner_notified = False
@@ -662,12 +501,12 @@ async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         email_sent = send_lead_email("Maison de Café — New lead", payload)
 
         if email_sent:
-            email_note = "✅ Email notification sent."
+            email_note = "✅ Email-сповіщення відправлено."
         else:
             email_note = (
-                "Note: SMTP is not configured; owner was notified in Telegram."
+                "Примітка: відправка на email не налаштована (SMTP). Сповіщення власнику відправлено в Telegram."
                 if owner_notified
-                else "Note: SMTP not configured and owner Telegram notify failed."
+                else "Примітка: email (SMTP) не налаштовано, і Telegram-сповіщення власнику не відправлено."
             )
 
         await update.message.reply_text(
@@ -724,6 +563,174 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     blocked_users.discard(str(context.args[0]))
     await update.message.reply_text("✅ Unblocked.")
 
+# =========================
+# STRICT KB ASSISTANT
+# =========================
+
+# Командные промпты для кнопок (строго “что именно нужно ответить”)
+# ВАЖНО: ответы должны быть короткие, структурированные и “человечные”.
+BUTTON_PROMPTS = {
+    "what": {
+        "ua": "Поясни: що таке Maison de Café. Дай чітко: формат, для кого, як працює, що входить у старт, що отримує партнер. Коротко, по суті.",
+        "ru": "Поясни: что такое Maison de Café. Дай чётко: формат, для кого, как работает, что входит в старт, что получает партнёр. Коротко, по сути.",
+        "en": "Explain what Maison de Café is. Clearly: concept, who it is for, how it works, what is included in the start package, what the partner gets. Short and to the point.",
+        "fr": "Explique ce qu’est Maison de Café : concept, pour qui, comment ça marche, ce qui est inclus au démarrage, ce que reçoit le partenaire. Court et clair.",
+        "nl": "Leg uit wat Maison de Café is: concept, voor wie, hoe het werkt, wat is inbegrepen bij de start, wat de partner krijgt. Kort en duidelijk.",
+    },
+    "price": {
+        "ua": "Відповідай про вартість відкриття. Дай структуру витрат і що входить/не входить. Якщо є діапазони — назви їх. Без загальних порад.",
+        "ru": "Ответь про стоимость открытия. Дай структуру затрат и что входит/не входит. Если есть диапазоны — назови. Без общих советов.",
+        "en": "Answer about opening cost. Provide cost structure and what is included/not included. If ranges exist, state them. No generic tips.",
+        "fr": "Réponds sur le coût d’ouverture : structure des coûts, inclus/non inclus. Si une fourchette existe, donne-la. Pas de conseils généraux.",
+        "nl": "Antwoord over opstartkosten: kostenstructuur, wat inbegrepen/niet inbegrepen is. Als er ranges zijn, noem ze. Geen algemene tips.",
+    },
+    "payback": {
+        "ua": (
+            "Відповідай тільки про окупність і прибуток. Обов’язково наведи приклад базової моделі: "
+            "маржа ~1.8€/чашка, 35 чашок/день, 30 днів. Порахуй валову маржу/міс і покажи приклад витрат ~500–600€/міс "
+            "та як з цього виходить чистий результат і логіка окупності. Коротко і зрозуміло."
+        ),
+        "ru": (
+            "Отвечай только про окупаемость и прибыль. Обязательно приведи пример базовой модели: "
+            "маржа ~1.8€/чашка, 35 чашек/день, 30 дней. Посчитай валовую маржу/мес и покажи пример расходов ~500–600€/мес "
+            "и как из этого получается чистый результат и логика окупаемости. Коротко и понятно."
+        ),
+        "en": (
+            "Answer ONLY about payback and profit. Must include a simple example model: "
+            "~€1.8 margin per cup, 35 cups/day, 30 days. Calculate gross margin per month and show example monthly costs ~€500–€600 "
+            "and how net result leads to payback logic. Short, clear."
+        ),
+        "fr": (
+            "Réponds UNIQUEMENT sur la rentabilité et le profit. Donne un exemple simple : "
+            "marge ~1,8€/tasse, 35 tasses/jour, 30 jours. Calcule la marge brute/mois et donne un exemple de coûts ~500–600€/mois "
+            "et explique la logique de retour sur investissement. Court et clair."
+        ),
+        "nl": (
+            "Antwoord ALLEEN over terugverdientijd en winst. Geef een eenvoudig voorbeeld: "
+            "~€1,8 marge per kop, 35 koppen/dag, 30 dagen. Bereken bruto marge/maand en geef voorbeeldkosten ~€500–€600/maand "
+            "en leg uit hoe dit tot terugverdientijd leidt. Kort en duidelijk."
+        ),
+    },
+    "franchise": {
+        "ua": "Відповідай про умови співпраці/франшизи: формат, підтримка, зобов’язання партнера, стандарти, сервіс. Без вигадок.",
+        "ru": "Ответь про условия сотрудничества/франшизы: формат, поддержка, обязательства партнера, стандарты, сервис. Без выдумок.",
+        "en": "Answer about franchise/partnership terms: format, support, partner obligations, standards, service. No inventions.",
+        "fr": "Réponds sur les conditions franchise/partenariat : format, support, obligations, standards, service. Sans inventer.",
+        "nl": "Antwoord over franchise-/samenwerkingsvoorwaarden: format, ondersteuning, verplichtingen, standaarden, service. Niet verzinnen.",
+    },
+}
+
+# Глобальные строгие инструкции “только из KB”
+STRICT_KB_RULES = {
+    "ua": (
+        "Ти — Макс, помічник Maison de Café. "
+        "КРИТИЧНО: відповідай ЛИШЕ використовуючи базу знань Maison de Café, яка підключена до цього Assistant. "
+        "НЕ вигадуй, НЕ узагальнюй, НЕ додумуй. "
+        "Якщо в базі немає відповіді — скажи дослівно, що не знайшов у базі знань, і запропонуй залишити заявку. "
+        "Відповідай українською."
+    ),
+    "ru": (
+        "Ты — Макс, помощник Maison de Café. "
+        "КРИТИЧНО: отвечай ТОЛЬКО используя базу знаний Maison de Café, подключенную к этому Assistant. "
+        "НЕ выдумывай, НЕ обобщай, НЕ додумывай. "
+        "Если в базе нет ответа — скажи, что не нашёл в базе знаний, и предложи оставить заявку. "
+        "Отвечай на русском."
+    ),
+    "en": (
+        "You are Max, Maison de Café assistant. "
+        "CRITICAL: answer ONLY using the Maison de Café knowledge base connected to this Assistant. "
+        "Do NOT invent, do NOT generalize, do NOT guess. "
+        "If the KB does not contain the answer, say you couldn’t find it in the Maison de Café knowledge base and suggest leaving a request. "
+        "Answer in English."
+    ),
+    "fr": (
+        "Tu es Max, assistant de Maison de Café. "
+        "CRITIQUE : réponds UNIQUEMENT à partir de la base de connaissances Maison de Café connectée à cet Assistant. "
+        "N’invente pas, ne généralise pas, ne devine pas. "
+        "Si la base ne contient pas la réponse, dis que tu ne l’as pas trouvée dans la base Maison de Café et propose de laisser une demande. "
+        "Réponds en français."
+    ),
+    "nl": (
+        "Je bent Max, assistent van Maison de Café. "
+        "KRITISCH: antwoord ALLEEN met informatie uit de Maison de Café kennisbank die aan deze Assistant is gekoppeld. "
+        "Niet verzinnen, niet generaliseren, niet gokken. "
+        "Als het niet in de kennisbank staat, zeg dat je het niet kon vinden en stel voor om een aanvraag achter te laten. "
+        "Antwoord in het Nederlands."
+    ),
+}
+
+
+def build_instructions(lang: str, action_key: Optional[str] = None) -> str:
+    base = STRICT_KB_RULES.get(lang, STRICT_KB_RULES["ua"])
+    if action_key and action_key in BUTTON_PROMPTS:
+        return base + "\n\n" + "TASK:\n" + BUTTON_PROMPTS[action_key][lang]
+    return base
+
+
+async def ask_assistant_strict(user_id: str, lang: str, user_text: str, action_key: Optional[str] = None) -> str:
+    """
+    Всегда:
+    - thread = (user_id, lang) чтобы контекст не мешал языкам
+    - instructions = строгие KB + язык + (если кнопка) task
+    """
+    thread_id = ensure_thread(user_id, lang)
+
+    client.beta.threads.messages.create(
+        thread_id=thread_id,
+        role="user",
+        content=user_text,
+    )
+
+    run = client.beta.threads.runs.create(
+        thread_id=thread_id,
+        assistant_id=ASSISTANT_ID,
+        instructions=build_instructions(lang, action_key),
+    )
+
+    while True:
+        rs = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        if rs.status == "completed":
+            break
+        if rs.status in ["failed", "cancelled", "expired"]:
+            return ""
+        await asyncio.sleep(1)
+
+    messages = client.beta.threads.messages.list(thread_id=thread_id)
+    if not messages.data:
+        return ""
+    # последнее сообщение ассистента обычно первым в списке
+    return messages.data[0].content[0].text.value
+
+
+def looks_like_kb_missing(ai_reply: str, lang: str) -> bool:
+    """
+    Доп.страховка: если ассистент “поплыл” и пишет общие вещи,
+    мы можем принудительно вернуть kb_missing.
+    (Условия мягкие, чтобы не ломать нормальные ответы.)
+    """
+    if not ai_reply:
+        return True
+    low = ai_reply.strip().lower()
+
+    # типичные признаки "я не знаю/вот общие советы" (на разных языках)
+    generic_markers = [
+        "i recommend", "generally", "in general", "typically",
+        "je recommande", "en général",
+        "ik raad aan", "over het algemeen",
+        "рекомендую", "в целом", "обычно",
+        "рекомендую", "загалом", "зазвичай",
+    ]
+    # если ассистент начинает давать “общие советы” — считаем это нарушением строгого режима
+    if any(m in low for m in generic_markers):
+        return True
+
+    # если слишком длинное “полотно” — тоже режем (не ограничение, а качество):
+    # Полотно обычно = ассистент фантазирует. Лучше вернуть kb_missing.
+    if len(ai_reply) > 2400:
+        return True
+
+    return False
+
 
 # =========================
 # NON-TEXT (FILES, PHOTOS) - BLOCK
@@ -769,15 +776,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(TEXTS[lang]["voice_fail"], reply_markup=mk_main_keyboard(lang))
             return
 
+        # если пользователь в лид-форме — голос считается вводом шага
         if user_id in lead_states:
             update.message.text = user_text
             handled = await handle_lead_form(update, context)
             if handled:
                 return
 
+        # иначе — строгий ассистент
         ai_reply = await ask_assistant_strict(user_id=user_id, lang=lang, user_text=user_text, action_key=None)
 
-        if ai_reply.strip() == "kb_missing" or not ai_reply:
+        if looks_like_kb_missing(ai_reply, lang):
             await update.message.reply_text(TEXTS[lang]["kb_missing"], reply_markup=mk_main_keyboard(lang))
             return
 
@@ -795,19 +804,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = (update.message.text or "").strip()
 
+    # BLOCKED
     if user_id in blocked_users:
         return
 
+    # антиспам / rate limit
     if is_gibberish_or_spam(text) or rate_limited(user_id):
         lang = get_lang(user_id)
         await update.message.reply_text(TEXTS[lang]["spam_stop"], reply_markup=mk_main_keyboard(lang))
         return
 
+    # если в лид-форме — приоритет лид-формы
     if user_id in lead_states:
         handled = await handle_lead_form(update, context)
         if handled:
             return
 
+    # язык меню
     if is_language_button(text):
         await show_language_menu(update, context)
         return
@@ -817,23 +830,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_language(update, context, chosen)
         return
 
+    # определяем: это кнопка?
     action = button_action_from_text(text)
 
+    # Контакты — статические (не через ассистент)
     if is_contacts_button(text):
         lang = get_lang(user_id)
         await update.message.reply_text(TEXTS[lang]["contacts_text"], reply_markup=mk_main_keyboard(lang))
         return
 
+    # Лид-форма — локальная логика
     if is_lead_button(text):
         await start_lead_form(update, context)
         return
 
-    # Контентные кнопки: язык = язык кнопки (жёстко)
+    # Если нажата одна из “контентных” кнопок (what/price/payback/franchise):
     if action and action[0] in {"what", "price", "payback", "franchise"}:
         action_key, button_lang = action
+
+        # ЖЁСТКО: язык = язык кнопки
         user_lang[user_id] = button_lang
 
+        # Текст для ассистента — в виде команды (а не “просто текст кнопки”)
+        # Это исключает “размытые ответы”.
         command_text = f"[BUTTON:{action_key}] {MENU[button_lang][action_key]}"
+
         ai_reply = await ask_assistant_strict(
             user_id=user_id,
             lang=button_lang,
@@ -841,19 +862,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             action_key=action_key,
         )
 
-        if ai_reply.strip() == "kb_missing" or not ai_reply:
+        if looks_like_kb_missing(ai_reply, button_lang):
             await update.message.reply_text(TEXTS[button_lang]["kb_missing"], reply_markup=mk_main_keyboard(button_lang))
             return
 
         await update.message.reply_text(ai_reply, reply_markup=mk_main_keyboard(button_lang))
         return
 
-    # Обычный вопрос
+    # Иначе: это обычный вопрос пользователя.
+    # Язык ответа = текущий выбранный язык пользователя.
     lang = get_lang(user_id)
     try:
         ai_reply = await ask_assistant_strict(user_id=user_id, lang=lang, user_text=text, action_key=None)
 
-        if ai_reply.strip() == "kb_missing" or not ai_reply:
+        if looks_like_kb_missing(ai_reply, lang):
             await update.message.reply_text(TEXTS[lang]["kb_missing"], reply_markup=mk_main_keyboard(lang))
             return
 
@@ -872,14 +894,18 @@ def main():
 
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(CommandHandler("block", cmd_block))
     application.add_handler(CommandHandler("unblock", cmd_unblock))
 
+    # voice BEFORE text
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
+    # non-text блокируем (фото/док/видео/аудио/стикер/анимации/и т.п.)
+    # ВАЖНО: НИКАКИХ filters.STICKER тут нет — это и было твоей ошибкой из лога.
     application.add_handler(
         MessageHandler(
             filters.PHOTO
@@ -897,6 +923,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
