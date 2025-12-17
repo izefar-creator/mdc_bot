@@ -6,7 +6,7 @@ import asyncio
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
-from typing import Dict, Optional, Tuple, Set
+from typing import Dict, Optional, Tuple, Set, Any
 
 from dotenv import load_dotenv
 
@@ -40,11 +40,6 @@ SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
 
-# "Корпоративные" параметры генерации (чтобы снизить творчество).
-# Если переменные не заданы — используем безопасные дефолты.
-RUN_TEMPERATURE = float(os.getenv("RUN_TEMPERATURE", "0.1"))
-RUN_TOP_P = float(os.getenv("RUN_TOP_P", "1.0"))
-
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
 if not OPENAI_API_KEY:
@@ -58,6 +53,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # =========================
 # STATE (IN-MEMORY)
 # =========================
+# ВАЖНО: тред отдельный на язык, чтобы языки не мешали друг другу.
 # (user_id, lang) -> thread_id
 user_threads: Dict[Tuple[str, str], str] = {}
 
@@ -86,6 +82,7 @@ LANG_LABELS = {
     "nl": "🇳🇱 Nederlands",
 }
 
+# Главное меню (кнопки) — локализовано
 MENU = {
     "ua": {
         "what": "☕ Що таке Maison de Café?",
@@ -139,7 +136,7 @@ TEXTS = {
         "welcome": (
             "Добрий день!\n"
             "Мене звати Макс, я віртуальний помічник компанії Maison de Café.\n"
-            "Я допоможу вам розібратися у всіх питаннях, пов’язаних з нашими кав’ярнями самообслуговування, запуском і умовами співпраці.\n"
+            "Я відповідаю як консультант і використовую лише офіційну базу знань Maison de Café.\n"
             "Щоб продовжити, підкажіть, будь ласка, як вас звати?"
         ),
         "choose_lang": "🌍 Оберіть мову:",
@@ -155,7 +152,7 @@ TEXTS = {
         "voice_fail": "Не вдалося розпізнати голос. Спробуйте ще раз.",
         "generic_error": "⚠️ Сталася помилка. Спробуйте ще раз.",
         "kb_missing": (
-            "Я не знайшов цього у базі знань Maison de Café.\n"
+            "Я не знайшов відповіді у базі знань Maison de Café.\n"
             "Щоб відповісти точно — залиште, будь ласка, заявку, і менеджер допоможе."
         ),
         "spam_stop": "⚠️ Схоже на спам. Я тимчасово не відповідаю на такі повідомлення.",
@@ -172,7 +169,7 @@ TEXTS = {
         "welcome": (
             "Добрый день!\n"
             "Меня зовут Макс, я виртуальный помощник компании Maison de Café.\n"
-            "Я помогу вам разобраться во всех вопросах, связанных с нашими кофейнями самообслуживания, запуском и условиями сотрудничества.\n"
+            "Я отвечаю как консультант и использую только официальную базу знаний Maison de Café.\n"
             "Чтобы продолжить, подскажите, пожалуйста, как вас зовут?"
         ),
         "choose_lang": "🌍 Выберите язык:",
@@ -188,7 +185,7 @@ TEXTS = {
         "voice_fail": "Не удалось распознать голос. Попробуйте ещё раз.",
         "generic_error": "⚠️ Произошла ошибка. Попробуйте ещё раз.",
         "kb_missing": (
-            "Я не нашёл этого в базе знаний Maison de Café.\n"
+            "Я не нашёл ответа в базе знаний Maison de Café.\n"
             "Чтобы ответить точно — оставьте, пожалуйста, заявку, и менеджер поможет."
         ),
         "spam_stop": "⚠️ Похоже на спам. Я временно не отвечаю на такие сообщения.",
@@ -204,8 +201,8 @@ TEXTS = {
     "en": {
         "welcome": (
             "Hello!\n"
-            "My name is Max, I’m the virtual assistant of Maison de Café.\n"
-            "I’ll help you with everything related to our self-service coffee points, launch costs, and partnership terms.\n"
+            "My name is Max, the virtual assistant of Maison de Café.\n"
+            "I answer as a consultant and use only the official Maison de Café knowledge base.\n"
             "To continue, may I know your name?"
         ),
         "choose_lang": "🌍 Choose a language:",
@@ -218,7 +215,7 @@ TEXTS = {
         "voice_fail": "I couldn't understand the voice message. Please try again.",
         "generic_error": "⚠️ Something went wrong. Please try again.",
         "kb_missing": (
-            "I couldn’t find this in the Maison de Café knowledge base.\n"
+            "I couldn’t find the answer in the Maison de Café knowledge base.\n"
             "To answer accurately, please leave a request and a manager will help you."
         ),
         "spam_stop": "⚠️ This looks like spam. I’m temporarily not responding to such messages.",
@@ -235,7 +232,7 @@ TEXTS = {
         "welcome": (
             "Bonjour !\n"
             "Je m’appelle Max, assistant virtuel de Maison de Café.\n"
-            "Je peux vous aider sur le lancement, les coûts et les conditions de partenariat.\n"
+            "Je réponds comme un consultant et j’utilise uniquement la base de connaissances officielle Maison de Café.\n"
             "Pour continuer, comment vous appelez-vous ?"
         ),
         "choose_lang": "🌍 Choisissez la langue :",
@@ -248,7 +245,7 @@ TEXTS = {
         "voice_fail": "Je n’ai pas pu comprendre le message vocal. Réessayez.",
         "generic_error": "⚠️ Une erreur est survenue. Réessayez.",
         "kb_missing": (
-            "Je n’ai pas trouvé cela dans la base de connaissances Maison de Café.\n"
+            "Je n’ai pas trouvé la réponse dans la base de connaissances Maison de Café.\n"
             "Pour répondre précisément, laissez une demande et un manager vous aidera."
         ),
         "spam_stop": "⚠️ Cela ressemble à du spam. Je ne réponds temporairement pas à ce type de messages.",
@@ -265,7 +262,7 @@ TEXTS = {
         "welcome": (
             "Hallo!\n"
             "Ik ben Max, de virtuele assistent van Maison de Café.\n"
-            "Ik help je met vragen over startkosten, winst en franchisevoorwaarden.\n"
+            "Ik antwoord als consultant en gebruik alleen de officiële Maison de Café kennisbank.\n"
             "Om verder te gaan: hoe heet je?"
         ),
         "choose_lang": "🌍 Kies een taal:",
@@ -278,7 +275,7 @@ TEXTS = {
         "voice_fail": "Ik kon het spraakbericht niet begrijpen. Probeer het opnieuw.",
         "generic_error": "⚠️ Er ging iets mis. Probeer het opnieuw.",
         "kb_missing": (
-            "Ik kon dit niet vinden in de Maison de Café kennisbank.\n"
+            "Ik kon het antwoord niet vinden in de Maison de Café kennisbank.\n"
             "Voor een exact antwoord: laat een aanvraag achter en een manager helpt je."
         ),
         "spam_stop": "⚠️ Dit lijkt op spam. Ik reageer tijdelijk niet op dit soort berichten.",
@@ -293,10 +290,10 @@ TEXTS = {
     },
 }
 
-
 # =========================
 # BUTTON LOOKUP (per language)
 # =========================
+# Возвращает ("action_key", "lang_of_button") по тексту кнопки.
 BUTTON_LOOKUP: Dict[str, Tuple[str, str]] = {}
 for lang in LANGS:
     for key, label in MENU[lang].items():
@@ -307,7 +304,8 @@ for lang in LANGS:
 # HELPERS
 # =========================
 def get_lang(user_id: str) -> str:
-    return user_lang.get(user_id, "ua")
+    return user_lang.get(user_id, "ua")  # default UA
+
 
 def mk_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
     m = MENU[lang]
@@ -319,6 +317,7 @@ def mk_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
+
 def mk_lang_keyboard() -> ReplyKeyboardMarkup:
     kb = [
         [LANG_LABELS["ua"], LANG_LABELS["ru"]],
@@ -327,14 +326,17 @@ def mk_lang_keyboard() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
 
+
 def parse_lang_choice(text: str) -> Optional[str]:
     for code, label in LANG_LABELS.items():
         if (text or "").strip() == label:
             return code
     return None
 
+
 def smtp_configured() -> bool:
     return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and SMTP_FROM and LEAD_EMAIL_TO)
+
 
 def send_lead_email(subject: str, body: str) -> bool:
     if not smtp_configured():
@@ -354,6 +356,7 @@ def send_lead_email(subject: str, body: str) -> bool:
         print("SMTP ERROR:", repr(e))
         return False
 
+
 def ensure_thread(user_id: str, lang: str) -> str:
     key = (user_id, lang)
     if key not in user_threads:
@@ -361,9 +364,11 @@ def ensure_thread(user_id: str, lang: str) -> str:
         user_threads[key] = thread.id
     return user_threads[key]
 
+
 def reset_threads(user_id: str):
     for lang in list(LANGS):
         user_threads.pop((user_id, lang), None)
+
 
 def is_gibberish_or_spam(text: str) -> bool:
     if not text:
@@ -378,6 +383,7 @@ def is_gibberish_or_spam(text: str) -> bool:
         return True
     return False
 
+
 def rate_limited(user_id: str, max_per_30s: int = 8) -> bool:
     now = time.time()
     timestamps = user_rate.get(user_id, [])
@@ -386,22 +392,180 @@ def rate_limited(user_id: str, max_per_30s: int = 8) -> bool:
     user_rate[user_id] = timestamps
     return len(timestamps) > max_per_30s
 
+
 def button_action_from_text(text: str) -> Optional[Tuple[str, str]]:
     return BUTTON_LOOKUP.get((text or "").strip())
+
 
 def is_language_button(text: str) -> bool:
     action = button_action_from_text(text)
     return bool(action and action[0] == "lang")
 
+
 def is_lead_button(text: str) -> bool:
     action = button_action_from_text(text)
     return bool(action and action[0] == "lead")
+
 
 def is_contacts_button(text: str) -> bool:
     action = button_action_from_text(text)
     return bool(action and action[0] == "contacts")
 
 
+# =========================
+# COMPLIANCE / KB HARD-GATE
+# =========================
+def _step_has_file_search(step: Any) -> bool:
+    """
+    В разных версиях SDK структура step может отличаться.
+    Пытаемся устойчиво проверить наличие вызова file_search.
+    """
+    try:
+        d = step.model_dump() if hasattr(step, "model_dump") else dict(step)
+    except Exception:
+        try:
+            d = dict(step)
+        except Exception:
+            d = {}
+
+    # Новые структуры обычно имеют step_details.tool_calls
+    details = d.get("step_details") or {}
+    tool_calls = details.get("tool_calls") or []
+
+    for tc in tool_calls:
+        # tc может быть dict или объект
+        try:
+            tcd = tc.model_dump() if hasattr(tc, "model_dump") else dict(tc)
+        except Exception:
+            try:
+                tcd = dict(tc)
+            except Exception:
+                tcd = {}
+
+        t = (tcd.get("type") or "").lower()
+        if "file_search" in t:
+            return True
+
+        # Иногда название инструмента лежит глубже
+        name = ""
+        if isinstance(tcd.get("file_search"), dict):
+            name = (tcd.get("file_search").get("name") or "").lower()
+        if "file_search" in name:
+            return True
+
+    return False
+
+
+def run_used_file_search(thread_id: str, run_id: str) -> bool:
+    """
+    Корпоративный KB-гейт:
+    считаем ответ допустимым только если в steps был реальный file_search.
+    """
+    try:
+        steps = client.beta.threads.runs.steps.list(thread_id=thread_id, run_id=run_id)
+        for step in steps.data:
+            if _step_has_file_search(step):
+                return True
+        return False
+    except Exception as e:
+        # Если steps недоступны/ошибка API — безопаснее считать, что file_search НЕ был.
+        print("RUN STEPS CHECK ERROR:", repr(e))
+        return False
+
+
+def looks_bad_or_empty(ai_reply: str) -> bool:
+    if not ai_reply:
+        return True
+    if len(ai_reply.strip()) < 2:
+        return True
+    if len(ai_reply) > 3500:
+        return True
+    return False
+
+
+# =========================
+# STRICT PROMPTS (BUTTONS) + HUMAN CONSULTANT RULES
+# =========================
+BUTTON_PROMPTS = {
+    "what": {
+        "ua": "Поясни: що таке Maison de Café. Дай чітко: формат, для кого, як працює, що входить у старт, що отримує партнер. Коротко, структуровано, “по-людськи”.",
+        "ru": "Поясни: что такое Maison de Café. Дай чётко: формат, для кого, как работает, что входит в старт, что получает партнёр. Коротко, структурировано, “по-человечески”.",
+        "en": "Explain what Maison de Café is: concept, who it is for, how it works, what is included in the start package, what the partner gets. Short, structured, human-like.",
+        "fr": "Explique Maison de Café : concept, pour qui, comment ça marche, ce qui est inclus au démarrage, ce que reçoit le partenaire. Court, structuré, ton “consultant”.",
+        "nl": "Leg Maison de Café uit: concept, voor wie, hoe het werkt, wat in de start zit, wat de partner krijgt. Kort, gestructureerd, menselijk.",
+    },
+    "price": {
+        "ua": "Відповідай про вартість відкриття. Дай структуру: що входить / що не входить. Якщо є діапазони — назви їх. Не додавай нічого від себе.",
+        "ru": "Ответь про стоимость открытия. Дай структуру: что входит / что не входит. Если есть диапазоны — назови их. Ничего от себя не добавляй.",
+        "en": "Answer about opening cost. Provide structure: included / not included. If ranges exist, state them. Do not add anything beyond the KB.",
+        "fr": "Réponds sur le coût d’ouverture : inclus / non inclus, et fourchettes si elles existent. N’ajoute rien au-delà de la base.",
+        "nl": "Antwoord over opstartkosten: inbegrepen / niet inbegrepen, en ranges als ze bestaan. Voeg niets toe buiten de kennisbank.",
+    },
+    "payback": {
+        "ua": "Відповідай тільки про окупність і прибуток. Якщо в базі є цифри — порахуй прозоро. Якщо цифр немає — скажи, що в базі немає точних даних і запропонуй залишити заявку.",
+        "ru": "Отвечай только про окупаемость и прибыль. Если в базе есть цифры — посчитай прозрачно. Если цифр нет — скажи, что в базе нет точных данных и предложи оставить заявку.",
+        "en": "Answer only about payback and profit. If the KB provides numbers, calculate transparently. If not, say the KB doesn’t contain precise numbers and suggest leaving a request.",
+        "fr": "Réponds uniquement sur la rentabilité/profit. Si la base donne des chiffres, calcule clairement. Sinon, indique qu’il manque des données précises et propose de laisser une demande.",
+        "nl": "Antwoord alleen over terugverdientijd/winst. Als de kennisbank cijfers heeft: reken transparant. Anders: zeg dat exacte cijfers ontbreken en stel een aanvraag voor.",
+    },
+    "franchise": {
+        "ua": "Відповідай про умови співпраці/франшизи: формат, підтримка, зобов’язання партнера, стандарти, сервіс, обмеження. Без вигадок.",
+        "ru": "Ответь про условия сотрудничества/франшизы: формат, поддержка, обязательства партнёра, стандарты, сервис, ограничения. Без выдумок.",
+        "en": "Answer about franchise/partnership terms: format, support, partner obligations, standards, service, limitations. No inventions.",
+        "fr": "Réponds sur les conditions franchise/partenariat : format, support, obligations, standards, service, limites. Sans inventer.",
+        "nl": "Antwoord over franchise-/samenwerkingsvoorwaarden: format, support, verplichtingen, standaarden, service, beperkingen. Niet verzinnen.",
+    },
+}
+
+HUMAN_CONSULTANT_RULES = {
+    "ua": (
+        "Ти — Макс, консультант Maison de Café.\n"
+        "КРИТИЧНО: Відповідай ТІЛЬКИ з бази знань Maison de Café через File Search.\n"
+        "ЖОДНИХ вигадок, домислів, загальних порад, і ЖОДНИХ інших бізнес-моделей (лише Maison de Café).\n"
+        "Тон: коротко, ввічливо, “по-людськи”, структуровано (списки/пункти), як sales-консультант.\n"
+        "Математика дозволена лише на основі цифр, що є в базі або надані користувачем; не придумуй нові цифри.\n"
+        "Якщо в базі немає відповіді — прямо скажи, що не знайшов у базі, і запропонуй залишити заявку."
+    ),
+    "ru": (
+        "Ты — Макс, консультант Maison de Café.\n"
+        "КРИТИЧНО: Отвечай ТОЛЬКО из базы знаний Maison de Café через File Search.\n"
+        "НИКАКИХ выдумок, догадок, общих советов и НИКАКИХ других бизнес-моделей (только Maison de Café).\n"
+        "Тон: коротко, вежливо, “по-человечески”, структурировано (списки/пункты), как sales-консультант.\n"
+        "Математика разрешена только на основе цифр из базы или цифр пользователя; новые цифры не придумывай.\n"
+        "Если ответа нет — прямо скажи, что не нашёл в базе, и предложи оставить заявку."
+    ),
+    "en": (
+        "You are Max, a Maison de Café consultant.\n"
+        "CRITICAL: Answer ONLY from the Maison de Café knowledge base via File Search.\n"
+        "No inventions, no guessing, no generic advice, and no other business models (Maison de Café only).\n"
+        "Tone: short, polite, human-like, structured (bullets), like a sales consultant.\n"
+        "Math is allowed only using numbers from the KB or provided by the user; do not create new numbers.\n"
+        "If the KB doesn’t contain the answer, say so and suggest leaving a request."
+    ),
+    "fr": (
+        "Tu es Max, consultant Maison de Café.\n"
+        "CRITIQUE : Réponds UNIQUEMENT à partir de la base de connaissances Maison de Café via File Search.\n"
+        "Aucune invention, aucun “conseil général”, aucun autre modèle business (Maison de Café uniquement).\n"
+        "Ton : court, poli, humain, structuré (puces), comme un consultant commercial.\n"
+        "Calculs autorisés uniquement avec les chiffres de la base ou fournis par l’utilisateur; n’invente pas de chiffres.\n"
+        "Si la base ne contient pas la réponse, dis-le clairement et propose de laisser une demande."
+    ),
+    "nl": (
+        "Je bent Max, consultant van Maison de Café.\n"
+        "KRITISCH: Antwoord ALLEEN vanuit de Maison de Café kennisbank via File Search.\n"
+        "Niet verzinnen, niet gokken, geen algemene adviezen, geen andere businessmodellen (alleen Maison de Café).\n"
+        "Toon: kort, beleefd, menselijk, gestructureerd (bullets), als sales-consultant.\n"
+        "Rekenen mag alleen met cijfers uit de kennisbank of van de gebruiker; verzin geen cijfers.\n"
+        "Staat het niet in de kennisbank: zeg dat duidelijk en stel een aanvraag voor."
+    ),
+}
+
+
+def build_instructions(lang: str, action_key: Optional[str] = None) -> str:
+    base = HUMAN_CONSULTANT_RULES.get(lang, HUMAN_CONSULTANT_RULES["ua"])
+    if action_key and action_key in BUTTON_PROMPTS:
+        return base + "\n\nTASK:\n" + BUTTON_PROMPTS[action_key][lang]
+    return base
 # =========================
 # /start
 # =========================
@@ -423,6 +587,7 @@ async def show_language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lang = get_lang(user_id)
     await update.message.reply_text(TEXTS[lang]["choose_lang"], reply_markup=mk_lang_keyboard())
 
+
 async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_code: str):
     user_id = str(update.effective_user.id)
     user_lang[user_id] = lang_code
@@ -434,7 +599,7 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang_
 
 
 # =========================
-# LEAD FORM FLOW (оставляем как есть; расширим позже)
+# LEAD FORM FLOW
 # =========================
 async def start_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -446,6 +611,7 @@ async def start_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
         TEXTS[lang]["lead_start"],
         reply_markup=mk_main_keyboard(lang),
     )
+
 
 async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = str(update.effective_user.id)
@@ -528,6 +694,7 @@ async def handle_lead_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 def is_owner(user_id: str) -> bool:
     return bool(OWNER_TELEGRAM_ID and user_id == str(OWNER_TELEGRAM_ID))
 
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not is_owner(user_id):
@@ -537,15 +704,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Threads: {len(user_threads)}",
         f"Lead states: {len(lead_states)}",
         f"Blocked: {len(blocked_users)}",
-        f"Assistant: {ASSISTANT_ID}",
-        f"Temp: {RUN_TEMPERATURE}, TopP: {RUN_TOP_P}",
     ]
     await update.message.reply_text("\n".join(lines))
+
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     reset_threads(user_id)
     await update.message.reply_text("✅ Thread reset.", reply_markup=mk_main_keyboard(get_lang(user_id)))
+
 
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -556,6 +723,7 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     blocked_users.add(str(context.args[0]))
     await update.message.reply_text("✅ Blocked.")
+
 
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -569,159 +737,17 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# STRICT KB ASSISTANT (CORPORATE GATING)
+# STRICT KB ASK (HARD FILE_SEARCH GATE)
 # =========================
-BUTTON_PROMPTS = {
-    "what": {
-        "ua": "Поясни: що таке Maison de Café. Дай чітко: формат, для кого, як працює, що входить у старт, що отримує партнер. Коротко, по суті.",
-        "ru": "Поясни: что такое Maison de Café. Дай чётко: формат, для кого, как работает, что входит в старт, что получает партнёр. Коротко, по сути.",
-        "en": "Explain what Maison de Café is. Clearly: concept, who it is for, how it works, what is included in the start package, what the partner gets. Short and to the point.",
-        "fr": "Explique ce qu’est Maison de Café : concept, pour qui, comment ça marche, ce qui est inclus au démarrage, ce que reçoit le partenaire. Court et clair.",
-        "nl": "Leg uit wat Maison de Café is: concept, voor wie, hoe het werkt, wat is inbegrepen bij de start, wat de partner krijgt. Kort en duidelijk.",
-    },
-    "price": {
-        "ua": "Відповідай про вартість відкриття. Дай структуру витрат і що входить/не входить. Якщо є діапазони — назви їх. Без загальних порад.",
-        "ru": "Ответь про стоимость открытия. Дай структуру затрат и что входит/не входит. Если есть диапазоны — назови. Без общих советов.",
-        "en": "Answer about opening cost. Provide cost structure and what is included/not included. If ranges exist, state them. No generic tips.",
-        "fr": "Réponds sur le coût d’ouverture : structure des coûts, inclus/non inclus. Si une fourchette existe, donne-la. Pas de conseils généraux.",
-        "nl": "Antwoord over opstartkosten: kostenstructuur, wat inbegrepen/niet inbegrepen is. Als er ranges zijn, noem ze. Geen algemene tips.",
-    },
-    "payback": {
-        "ua": (
-            "Відповідай тільки про окупність і прибуток. Обов’язково наведи приклад базової моделі: "
-            "маржа ~1.8€/чашка, 35 чашок/день, 30 днів. Порахуй валову маржу/міс і покажи приклад витрат ~500–600€/міс "
-            "та як з цього виходить чистий результат і логіка окупності. Коротко і зрозуміло."
-        ),
-        "ru": (
-            "Отвечай только про окупаемость и прибыль. Обязательно приведи пример базовой модели: "
-            "маржа ~1.8€/чашка, 35 чашек/день, 30 дней. Посчитай валовую маржу/мес и покажи пример расходов ~500–600€/мес "
-            "и как из этого получается чистый результат и логика окупаемости. Коротко и понятно."
-        ),
-        "en": (
-            "Answer ONLY about payback and profit. Must include a simple example model: "
-            "~€1.8 margin per cup, 35 cups/day, 30 days. Calculate gross margin per month and show example monthly costs ~€500–€600 "
-            "and how net result leads to payback logic. Short, clear."
-        ),
-        "fr": (
-            "Réponds UNIQUEMENT sur la rentabilité et le profit. Donne un exemple simple : "
-            "marge ~1,8€/tasse, 35 tasses/jour, 30 jours. Calcule la marge brute/mois et donne un exemple de coûts ~500–600€/mois "
-            "et explique la logique de retour sur investissement. Court et clair."
-        ),
-        "nl": (
-            "Antwoord ALLEEN over terugverdientijd en winst. Geef een eenvoudig voorbeeld: "
-            "~€1,8 marge per kop, 35 koppen/dag, 30 dagen. Bereken bruto marge/maand en geef voorbeeldkosten ~€500–€600/maand "
-            "en leg uit hoe dit tot terugverdientijd leidt. Kort en duidelijk."
-        ),
-    },
-    "franchise": {
-        "ua": "Відповідай про умови співпраці/франшизи: формат, підтримка, зобов’язання партнера, стандарти, сервіс. Без вигадок.",
-        "ru": "Ответь про условия сотрудничества/франшизы: формат, поддержка, обязательства партнера, стандарты, сервис. Без выдумок.",
-        "en": "Answer about franchise/partnership terms: format, support, partner obligations, standards, service. No inventions.",
-        "fr": "Réponds sur les conditions franchise/partenariat : format, support, obligations, standards, service. Sans inventer.",
-        "nl": "Antwoord over franchise-/samenwerkingsvoorwaarden: format, ondersteuning, verplichtingen, standaarden, service. Niet verzinnen.",
-    },
-}
-
-STRICT_KB_RULES = {
-    "ua": (
-        "Ти — Макс, помічник Maison de Café.\n"
-        "КРИТИЧНО (compliance): відповідай ЛИШЕ використовуючи базу знань Maison de Café (через File Search).\n"
-        "НЕ вигадуй, НЕ узагальнюй, НЕ додумуй.\n"
-        "Якщо в базі немає відповіді — скажи, що не знайшов у базі знань, і запропонуй залишити заявку.\n"
-        "Стиль: людяно, коротко, структуровано (3–7 пунктів), без «в цілому/зазвичай/рекомендую».\n"
-        "Відповідай українською."
-    ),
-    "ru": (
-        "Ты — Макс, помощник Maison de Café.\n"
-        "КРИТИЧНО (compliance): отвечай ТОЛЬКО используя базу знаний Maison de Café (через File Search).\n"
-        "НЕ выдумывай, НЕ обобщай, НЕ додумывай.\n"
-        "Если в базе нет ответа — скажи, что не нашёл в базе знаний, и предложи оставить заявку.\n"
-        "Стиль: по-человечески, коротко, структурно (3–7 пунктов), без «в целом/обычно/рекомендую».\n"
-        "Отвечай на русском."
-    ),
-    "en": (
-        "You are Max, Maison de Café assistant.\n"
-        "CRITICAL (compliance): answer ONLY using the Maison de Café knowledge base via File Search.\n"
-        "Do NOT invent, do NOT generalize, do NOT guess.\n"
-        "If the KB doesn’t contain the answer, say you couldn’t find it in the Maison de Café knowledge base and suggest leaving a request.\n"
-        "Style: human, short, structured (3–7 bullets), no “generally/typically/I recommend”.\n"
-        "Answer in English."
-    ),
-    "fr": (
-        "Tu es Max, assistant de Maison de Café.\n"
-        "CRITIQUE (compliance) : réponds UNIQUEMENT via File Search à partir de la base Maison de Café.\n"
-        "N’invente pas, ne généralise pas, ne devine pas.\n"
-        "Si la base ne contient pas la réponse, dis que tu ne l’as pas trouvée et propose de laisser une demande.\n"
-        "Style : humain, court, structuré (3–7 points), pas de “en général/je recommande”.\n"
-        "Réponds en français."
-    ),
-    "nl": (
-        "Je bent Max, assistent van Maison de Café.\n"
-        "KRITISCH (compliance): antwoord ALLEEN via File Search met info uit de Maison de Café kennisbank.\n"
-        "Niet verzinnen, niet generaliseren, niet gokken.\n"
-        "Als het niet in de kennisbank staat, zeg dat je het niet kon vinden en stel voor om een aanvraag achter te laten.\n"
-        "Stijl: menselijk, kort, gestructureerd (3–7 punten), geen “over het algemeen/ik raad aan”.\n"
-        "Antwoord in het Nederlands."
-    ),
-}
-
-def build_instructions(lang: str, action_key: Optional[str] = None) -> str:
-    base = STRICT_KB_RULES.get(lang, STRICT_KB_RULES["ua"])
-    if action_key and action_key in BUTTON_PROMPTS:
-        return base + "\n\nTASK:\n" + BUTTON_PROMPTS[action_key][lang]
-    return base
-
-
-def _safe_get(obj, attr: str, default=None):
-    try:
-        return getattr(obj, attr, default)
-    except Exception:
-        return default
-
-def _tool_calls_from_step(step):
+async def ask_assistant_strict(
+    user_id: str,
+    lang: str,
+    user_text: str,
+    action_key: Optional[str] = None,
+) -> Tuple[str, bool]:
     """
-    OpenAI SDK может вернуть step_details как объект.
-    Нам нужно достать tool_calls максимально устойчиво.
-    """
-    details = _safe_get(step, "step_details", None)
-    if not details:
-        return []
-    tc = _safe_get(details, "tool_calls", None)
-    if tc:
-        return tc
-    # иногда может быть dict
-    if isinstance(details, dict) and details.get("tool_calls"):
-        return details.get("tool_calls")
-    return []
-
-def run_used_file_search(steps) -> bool:
-    """
-    CORPORATE GATE:
-    True только если реально был tool_call типа file_search.
-    """
-    try:
-        data = _safe_get(steps, "data", []) or []
-        for step in data:
-            if _safe_get(step, "type", None) != "tool_calls":
-                continue
-            tool_calls = _tool_calls_from_step(step)
-            for tc in tool_calls or []:
-                t = _safe_get(tc, "type", None)
-                if t is None and isinstance(tc, dict):
-                    t = tc.get("type")
-                if t == "file_search":
-                    return True
-    except Exception as e:
-        print("run_used_file_search ERROR:", repr(e))
-    return False
-
-
-async def ask_assistant_strict(user_id: str, lang: str, user_text: str, action_key: Optional[str] = None) -> str:
-    """
-    Корпоративная логика:
-    - отдельный thread на (user_id, lang)
-    - инструкции: строгие KB + язык + (если кнопка) task
-    - ГЕЙТ: если file_search не был вызван — ответ запрещён
+    Возвращает (answer, used_file_search).
+    Корпоративный принцип: ответ валиден только если used_file_search == True.
     """
     thread_id = ensure_thread(user_id, lang)
 
@@ -735,49 +761,30 @@ async def ask_assistant_strict(user_id: str, lang: str, user_text: str, action_k
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
         instructions=build_instructions(lang, action_key),
-        temperature=RUN_TEMPERATURE,
-        top_p=RUN_TOP_P,
     )
 
+    # polling
     while True:
         rs = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
         if rs.status == "completed":
             break
         if rs.status in ["failed", "cancelled", "expired"]:
-            return ""
-        await asyncio.sleep(0.8)
+            return ("", False)
+        await asyncio.sleep(1)
 
-    # CORPORATE GATE: проверяем, был ли file_search
-    try:
-        steps = client.beta.threads.runs.steps.list(thread_id=thread_id, run_id=run.id)
-        if not run_used_file_search(steps):
-            # Запрещаем любые ответы без retrieval
-            print("GATE: no file_search was used -> kb_missing")
-            return ""
-    except Exception as e:
-        # Если steps не удалось получить — лучше блокировать, чем выпускать галлюцинацию
-        print("GATE ERROR (steps.list failed) -> kb_missing:", repr(e))
-        return ""
+    used_fs = run_used_file_search(thread_id=thread_id, run_id=run.id)
 
     messages = client.beta.threads.messages.list(thread_id=thread_id)
     if not messages.data:
-        return ""
+        return ("", used_fs)
 
-    return messages.data[0].content[0].text.value
+    # последнее сообщение ассистента обычно первым в списке
+    try:
+        answer = messages.data[0].content[0].text.value
+    except Exception:
+        answer = ""
 
-
-def looks_like_kb_missing(ai_reply: str, lang: str) -> bool:
-    """
-    Доп.страховка по качеству. Основная защита — retrieval gate.
-    """
-    if not ai_reply:
-        return True
-
-    # если ассистент выдал слишком длинное полотно — обычно это плохой знак для UX
-    if len(ai_reply) > 2400:
-        return True
-
-    return False
+    return (answer, used_fs)
 
 
 # =========================
@@ -787,6 +794,8 @@ async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     lang = get_lang(user_id)
     await update.message.reply_text(TEXTS[lang]["no_files"], reply_markup=mk_main_keyboard(lang))
+
+
 # =========================
 # VOICE HANDLER
 # =========================
@@ -829,9 +838,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if handled:
                 return
 
-        ai_reply = await ask_assistant_strict(user_id=user_id, lang=lang, user_text=user_text, action_key=None)
+        # иначе — строгий ассистент (HARD file_search gate)
+        ai_reply, used_fs = await ask_assistant_strict(
+            user_id=user_id,
+            lang=lang,
+            user_text=user_text,
+            action_key=None,
+        )
 
-        if looks_like_kb_missing(ai_reply, lang):
+        if (not used_fs) or looks_bad_or_empty(ai_reply):
             await update.message.reply_text(TEXTS[lang]["kb_missing"], reply_markup=mk_main_keyboard(lang))
             return
 
@@ -849,21 +864,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     text = (update.message.text or "").strip()
 
+    # BLOCKED
     if user_id in blocked_users:
         return
 
+    # антиспам / rate limit
     if is_gibberish_or_spam(text) or rate_limited(user_id):
         lang = get_lang(user_id)
         await update.message.reply_text(TEXTS[lang]["spam_stop"], reply_markup=mk_main_keyboard(lang))
         return
 
-    # лид-форма приоритет
+    # если в лид-форме — приоритет лид-формы
     if user_id in lead_states:
         handled = await handle_lead_form(update, context)
         if handled:
             return
 
-    # меню языка
+    # язык меню
     if is_language_button(text):
         await show_language_menu(update, context)
         return
@@ -873,47 +890,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_language(update, context, chosen)
         return
 
-    # Контакты — статические
+    # определяем: это кнопка?
+    action = button_action_from_text(text)
+
+    # Контакты — статические (не через ассистент)
     if is_contacts_button(text):
         lang = get_lang(user_id)
         await update.message.reply_text(TEXTS[lang]["contacts_text"], reply_markup=mk_main_keyboard(lang))
         return
 
-    # Лид-форма
+    # Лид-форма — локальная логика
     if is_lead_button(text):
         await start_lead_form(update, context)
         return
 
-    # кнопки контента
-    action = button_action_from_text(text)
+    # Контентные кнопки: what/price/payback/franchise
     if action and action[0] in {"what", "price", "payback", "franchise"}:
         action_key, button_lang = action
 
         # ЖЁСТКО: язык = язык кнопки
         user_lang[user_id] = button_lang
 
-        command_text = f"[BUTTON:{action_key}] {MENU[button_lang][action_key]}"
+        # ВАЖНО: в user_text отправляем нормальный “вопрос”, чтобы file_search триггерился стабильно.
+        # НЕ отправляем [BUTTON:...] — это ломало поисковое поведение.
+        user_query = MENU[button_lang][action_key]
 
-        ai_reply = await ask_assistant_strict(
+        ai_reply, used_fs = await ask_assistant_strict(
             user_id=user_id,
             lang=button_lang,
-            user_text=command_text,
+            user_text=user_query,
             action_key=action_key,
         )
 
-        if looks_like_kb_missing(ai_reply, button_lang):
+        # HARD GATE
+        if (not used_fs) or looks_bad_or_empty(ai_reply):
             await update.message.reply_text(TEXTS[button_lang]["kb_missing"], reply_markup=mk_main_keyboard(button_lang))
             return
 
         await update.message.reply_text(ai_reply, reply_markup=mk_main_keyboard(button_lang))
         return
 
-    # обычный вопрос
+    # Обычный текстовый вопрос
     lang = get_lang(user_id)
     try:
-        ai_reply = await ask_assistant_strict(user_id=user_id, lang=lang, user_text=text, action_key=None)
+        ai_reply, used_fs = await ask_assistant_strict(
+            user_id=user_id,
+            lang=lang,
+            user_text=text,
+            action_key=None,
+        )
 
-        if looks_like_kb_missing(ai_reply, lang):
+        if (not used_fs) or looks_bad_or_empty(ai_reply):
             await update.message.reply_text(TEXTS[lang]["kb_missing"], reply_markup=mk_main_keyboard(lang))
             return
 
@@ -929,8 +956,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 def main():
     print("🚀 Bot is starting...")
-    print("ASSISTANT_ID =", ASSISTANT_ID)
-    print("RUN_TEMPERATURE =", RUN_TEMPERATURE, "RUN_TOP_P =", RUN_TOP_P)
 
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -944,7 +969,7 @@ def main():
     # voice BEFORE text
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # non-text блокируем
+    # non-text блокируем (фото/док/видео/аудио/стикер/анимации/и т.п.)
     application.add_handler(
         MessageHandler(
             filters.PHOTO
