@@ -574,13 +574,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if lang in LANGS:
             u.lang = lang
             save_state()
+        # IMPORTANT: do NOT re-attach main keyboard here to avoid "buttons after every message"
         await q.message.reply_text(
-            {"UA":"Мову змінено.","RU":"Язык изменён.","EN":"Language updated.","FR":"Langue mise à jour."}.get(u.lang, "OK"),
-            reply_markup=main_keyboard(u.lang),
+            {"UA":"Мову змінено.","RU":"Язык изменён.","EN":"Language updated.","FR":"Langue mise à jour."}.get(u.lang, "OK")
         )
         return
 
     if data == "m:lang":
+        # Show language picker (this is expected to have buttons)
         await q.message.reply_text(
             {"UA":"Оберіть мову:","RU":"Выберите язык:","EN":"Choose language:","FR":"Choisissez la langue:"}.get(u.lang, "Choose language:"),
             reply_markup=lang_keyboard(),
@@ -600,22 +601,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         {"UA":"Не зміг відправити презентацію. Напишіть мені — і я надішлю її іншим способом.",
                          "RU":"Не получилось отправить презентацию. Напишите мне — и я пришлю другим способом.",
                          "EN":"I couldn't send the presentation file here. Message me and I’ll share it another way.",
-                         "FR":"Je n’arrive pas à envoyer la présentation ici. Écrivez-moi et je la partagerai autrement."}.get(u.lang, "Couldn't send the presentation."),
-                        reply_markup=main_keyboard(u.lang),
+                         "FR":"Je n’arrive pas à envoyer la présentation ici. Écrivez-moi et je la partagerai autrement."}.get(u.lang, "Couldn't send the presentation.")
                     )
             else:
                 await q.message.reply_text(
                     {"UA":"Презентація ще не підключена. Я можу надіслати її, як тільки ми додамо файл.",
                      "RU":"Презентация ещё не подключена. Могу отправить, как только добавим файл.",
                      "EN":"The presentation is not connected yet. I can send it as soon as we add the file.",
-                     "FR":"La présentation n’est pas encore connectée. Je peux l’envoyer dès que le fichier est ajouté."}.get(u.lang, "Presentation not connected yet."),
-                    reply_markup=main_keyboard(u.lang),
+                     "FR":"La présentation n’est pas encore connectée. Je peux l’envoyer dès que le fichier est ajouté."}.get(u.lang, "Presentation not connected yet.")
                 )
             return
 
         if key in ("what", "price", "payback", "terms", "contacts"):
             gl = gold_lang(u.lang)
-            await q.message.reply_text(GOLD[gl][key], reply_markup=main_keyboard(u.lang))
+            # IMPORTANT: no main_keyboard here -> keyboard remains only on the /start message
+            await q.message.reply_text(GOLD[gl][key])
             return
         if key == "lead":
             txt = {
@@ -639,8 +639,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     ans = await ask_assistant(user_id=user_id, user_text=text, lang=u.lang)
 
-    await update.message.reply_text(ans, reply_markup=main_keyboard(u.lang))
-
+    # IMPORTANT: no keyboard on every answer (menu stays only on /start message)
+    await update.message.reply_text(ans)
 
 # Polling anti-conflict: clear webhook to avoid telegram.error.Conflict
 async def post_init(app: Application) -> None:
