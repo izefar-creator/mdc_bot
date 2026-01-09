@@ -1,25 +1,28 @@
+# =========================
+# bot.py (PART 1/2)
+# Maison de Café — Max bot
+# =========================
+
 import os
 import re
 import json
 import time
 import asyncio
 import logging
-import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 from dotenv import load_dotenv
+
+import fcntl  # Linux-only; OK on Render
 
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 from telegram.constants import ChatAction
-
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -33,44 +36,35 @@ from telegram.ext import (
 from openai import OpenAI
 
 
-# ==========================================================
+# =========================
 # ENV
-# ==========================================================
+# =========================
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-ASSISTANT_ID = os.getenv("ASSISTANT_ID", "").strip()
+# Support both names to avoid "missing token" regressions
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "").strip()
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+ASSISTANT_ID = (os.getenv("ASSISTANT_ID") or "").strip()
 
-OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID", "").strip()
-
-# Telegram file_id for presentation PDF (one file for all languages)
-PRESENTATION_FILE_ID = os.getenv("PRESENTATION_FILE_ID", "").strip()
-
-# Verifier model (2nd pass). No KB access.
-VERIFY_MODEL = os.getenv("VERIFY_MODEL", "gpt-4o-mini").strip()
-
-# STT model for voice
-STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe").strip()
-
-# Instance lock file (Variant B)
-INSTANCE_LOCK_FILE = os.getenv("INSTANCE_LOCK_FILE", "healthbot_instance.lock").strip()
+OWNER_TELEGRAM_ID = (os.getenv("OWNER_TELEGRAM_ID") or "").strip()
+PRESENTATION_FILE_ID = (os.getenv("PRESENTATION_FILE_ID") or "").strip()  # Telegram file_id for PDF
+VERIFY_MODEL = (os.getenv("VERIFY_MODEL") or "gpt-4o-mini").strip()
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN)")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing")
+    raise RuntimeError("Missing OPENAI_API_KEY")
 if not ASSISTANT_ID:
-    raise RuntimeError("ASSISTANT_ID missing")
+    raise RuntimeError("Missing ASSISTANT_ID")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ==========================================================
+# =========================
 # LOGGING
-# ==========================================================
+# =========================
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("healthbot")
+log = logging.getLogger("mdc_bot")
 
 
 def mask_token(tok: str) -> str:
@@ -83,65 +77,53 @@ def mask_token(tok: str) -> str:
 
 log.info("Boot: TELEGRAM token=%s", mask_token(TELEGRAM_BOT_TOKEN))
 log.info("Boot: ASSISTANT_ID=%s", ASSISTANT_ID)
+log.info("Boot: VERIFY_MODEL=%s", VERIFY_MODEL)
 
 
-# ==========================================================
-# SINGLE-INSTANCE LOCK (Variant B)
-# If another process is running, this one exits immediately.
-# ==========================================================
-_lock_handle = None
+# =========================
+# SINGLE INSTANCE LOCK (Variant B)
+# =========================
+LOCK_PATH = "/tmp/mdc_bot.lock"
+_lock_fd = None
 
 
-def acquire_single_instance_lock_or_exit() -> None:
+def acquire_single_instance_lock() -> None:
     """
-    Variant B: file lock. If cannot lock -> exit.
-    Render/Linux supports fcntl. Fallback to exclusive create.
+    Prevent two processes from polling simultaneously (telegram.error.Conflict).
+    Variant B: OS file lock. If lock is held -> exit immediately.
     """
-    global _lock_handle
-    lock_path = Path(INSTANCE_LOCK_FILE).resolve()
-
-    # Ensure directory exists
-    if lock_path.parent and not lock_path.parent.exists():
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-
+    global _lock_fd
+    _lock_fd = open(LOCK_PATH, "w")
     try:
-        import fcntl  # Linux/Unix
-        _lock_handle = open(lock_path, "w")
-        try:
-            fcntl.flock(_lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise RuntimeError("Another instance is already running (lock busy).")
-        _lock_handle.write(str(os.getpid()))
-        _lock_handle.flush()
-        log.info("Instance lock acquired: %s", str(lock_path))
-        return
-    except ImportError:
-        # Fallback: exclusive create
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            _lock_handle = os.fdopen(fd, "w")
-            _lock_handle.write(str(os.getpid()))
-            _lock_handle.flush()
-            log.info("Instance lock acquired (fallback): %s", str(lock_path))
-            return
-        except FileExistsError:
-            raise RuntimeError("Another instance is already running (lock file exists).")
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd.write(str(os.getpid()))
+        _lock_fd.flush()
+        log.info("Single-instance lock acquired: %s", LOCK_PATH)
+    except BlockingIOError:
+        log.error("Another instance is already running. Exiting.")
+        raise SystemExit(0)
 
 
-# ==========================================================
+# =========================
 # STATE (persisted)
-# ==========================================================
-STATE_FILE = Path("healthbot_state.json")
+# =========================
+STATE_FILE = Path("mdc_state.json")
 
 
 @dataclass
 class UserState:
-    lang: str = "RU"       # UA/RU/EN/FR
-    thread_id: str = ""    # per-user thread
+    lang: str = "RU"          # UA / RU / EN / FR
+    thread_id: str = ""       # OpenAI thread per user (stable)
+    lead_step: int = 0        # 0=off, 1..n steps
+    lead_data: Dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.lead_data is None:
+            self.lead_data = {}
 
 
 _state: Dict[str, UserState] = {}
-_blocked = set()
+_blocked: set = set()
 
 
 def load_state() -> None:
@@ -150,16 +132,32 @@ def load_state() -> None:
         _state = {}
         _blocked = set()
         return
+
     raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     _blocked = set(raw.get("blocked", []))
     users = raw.get("users", {})
-    _state = {uid: UserState(**users[uid]) for uid in users}
+    _state = {}
+    for uid, data in users.items():
+        _state[uid] = UserState(
+            lang=data.get("lang", "RU"),
+            thread_id=data.get("thread_id", ""),
+            lead_step=data.get("lead_step", 0),
+            lead_data=data.get("lead_data", {}) or {},
+        )
 
 
 def save_state() -> None:
     raw = {
-        "blocked": sorted(_blocked),
-        "users": {uid: {"lang": s.lang, "thread_id": s.thread_id} for uid, s in _state.items()},
+        "blocked": sorted(list(_blocked)),
+        "users": {
+            uid: {
+                "lang": s.lang,
+                "thread_id": s.thread_id,
+                "lead_step": s.lead_step,
+                "lead_data": s.lead_data,
+            }
+            for uid, s in _state.items()
+        },
     }
     STATE_FILE.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -171,6 +169,9 @@ def get_user(user_id: str) -> UserState:
     return _state[user_id]
 
 
+# =========================
+# LANG / LABELS
+# =========================
 LANGS = ["UA", "RU", "EN", "FR"]
 
 LANG_LABELS = {
@@ -180,50 +181,6 @@ LANG_LABELS = {
     "FR": "🇫🇷 Français",
 }
 
-# Reply buttons labels per language (7 buttons)
-MENU_LABELS = {
-    "UA": {
-        "what": "☕ Що таке Maison de Café?",
-        "price": "💶 Скільки коштує відкрити?",
-        "payback": "📈 Окупність і прибуток",
-        "terms": "🤝 Умови співпраці",
-        "contacts": "📞 Контакти / наступний крок",
-        "lead": "📝 Залишити заявку",
-        "lang": "🌍 Мова",
-        "presentation": "📄 Презентація",
-    },
-    "RU": {
-        "what": "☕ Что такое Maison de Café?",
-        "price": "💶 Сколько стоит открыть?",
-        "payback": "📈 Окупаемость и прибыль",
-        "terms": "🤝 Условия сотрудничества",
-        "contacts": "📞 Контакты / следующий шаг",
-        "lead": "📝 Оставить заявку",
-        "lang": "🌍 Язык",
-        "presentation": "📄 Презентация",
-    },
-    "EN": {
-        "what": "☕ What is Maison de Café?",
-        "price": "💶 Opening cost",
-        "payback": "📈 Payback & profit",
-        "terms": "🤝 Partnership terms",
-        "contacts": "📞 Contacts / next step",
-        "lead": "📝 Leave a request",
-        "lang": "🌍 Language",
-        "presentation": "📄 Presentation",
-    },
-    "FR": {
-        "what": "☕ Qu’est-ce que Maison de Café ?",
-        "price": "💶 Coût de lancement",
-        "payback": "📈 Rentabilité & profit",
-        "terms": "🤝 Conditions",
-        "contacts": "📞 Contacts / prochaine étape",
-        "lead": "📝 Laisser une demande",
-        "lang": "🌍 Langue",
-        "presentation": "📄 Présentation",
-    },
-}
-
 CONTACTS_TEXT = {
     "UA": "Контакти Maison de Café:\n• Email: maisondecafe.coffee@gmail.com\n• Телефон: +32 470 600 806\n• Telegram: https://t.me/maisondecafe",
     "RU": "Контакты Maison de Café:\n• Email: maisondecafe.coffee@gmail.com\n• Телефон: +32 470 600 806\n• Telegram: https://t.me/maisondecafe",
@@ -231,431 +188,424 @@ CONTACTS_TEXT = {
     "FR": "Contacts Maison de Café:\n• Email : maisondecafe.coffee@gmail.com\n• Téléphone : +32 470 600 806\n• Telegram : https://t.me/maisondecafe",
 }
 
-# ==========================================================
-# GOLD STANDARD (5 answers) — use for menu buttons
-# RU version is EXACT from user; other languages are consistent translations.
-# ==========================================================
-GOLD = {
+# =========================
+# GOLD STANDARD (5 answers) — EXACT CORE MEANING
+# =========================
+GOLD_5 = {
     "RU": {
         "what": (
-            "Это хороший вопрос, с него обычно и начинается знакомство. "
-            "Maison de Café — это готовая точка самообслуживания под ключ в Бельгии. "
+            "Хороший вопрос, с него обычно и начинается знакомство. Maison de Café — это готовая точка самообслуживания под ключ в Бельгии. "
             "Вы получаете профессиональный кофейный автомат Jetinno JL-300, фирменную стойку, систему контроля и стартовый набор ингредиентов, "
-            "а также обучение и сопровождение запуска. "
-            "Формат рассчитан на быстрый старт без опыта в кофейном бизнесе и работу без персонала. "
+            "а также обучение и сопровождение запуска. Формат рассчитан на быстрый старт без опыта в кофейном бизнесе и работу без персонала. "
             "Дальше логично либо разобрать стоимость запуска, либо посмотреть на окупаемость и реальные цифры."
         ),
         "price": (
-            "Это хороший вопрос, давайте детально разберем этот вопрос. "
-            "Базовая стоимость запуска точки Maison de Café в Бельгии составляет 9 800 €. "
+            "Это самый логичный вопрос, и тут важно сразу говорить честно. Базовая стоимость запуска точки Maison de Café в Бельгии составляет 9 800 €. "
             "В эту сумму входит профессиональный автомат Jetinno JL-300, фирменная стойка, телеметрия, стартовый набор ингредиентов, обучение и полный запуск. "
             "Это не франшиза с пакетами и скрытыми платежами — вы платите за конкретное оборудование и сервис. "
             "Отдельно обычно учитываются только вещи, зависящие от вашей ситуации, например аренда локации или электричество. "
             "Дальше логично либо посмотреть окупаемость, либо обсудить вашу будущую локацию."
         ),
         "payback": (
-            "Это хороший вопрос, давайте детально разберем этот вопрос. "
-            "В базовой модели Maison de Café средняя маржа с одной чашки составляет около 1,8 €, а типичный объём продаж — примерно 35 чашек в день. "
-            "Это даёт валовую маржу порядка 1 900 € в месяц, из которой после стандартных расходов обычно остаётся около 1 200–1 300 € чистой прибыли. "
+            "Без понимания цифр действительно нет смысла идти дальше. В базовой модели Maison de Café средняя маржа с одной чашки составляет около 1,8 €, "
+            "а типичный объём продаж — примерно 35 чашек в день. Это даёт валовую маржу порядка 1 900 € в месяц, "
+            "из которой после стандартных расходов обычно остаётся около 1 200–1 300 € чистой прибыли. "
             "При таких показателях точка выходит на окупаемость в среднем за 9–12 месяцев, но реальный результат всегда зависит от локации и потока людей. "
             "Можем разобрать конкретное место или перейти к условиям сотрудничества."
         ),
         "terms": (
-            "Это хороший вопрос, давайте детально разберем этот вопрос. "
-            "Maison de Café — это не классическая франшиза с жёсткими правилами и паушальными взносами. "
+            "Это важный момент, и здесь часто бывают неправильные ожидания. Maison de Café — это не классическая франшиза с жёсткими правилами и паушальными взносами. "
             "Это партнёрская модель: вы инвестируете в оборудование и управляете точкой, а мы обеспечиваем продукт, стандарты качества, обучение и поддержку на старте. "
-            "У вас остаётся свобода в выборе локации и управлении бизнесом. "
-            "Можем обсудить вашу идею или перейти к следующему шагу."
+            "У вас остаётся свобода в выборе локации и управлении бизнесом. Можем обсудить вашу идею или перейти к следующему шагу."
         ),
-        "contacts": (
-            "Это хороший вопрос, давайте детально разберем этот вопрос. "
-            "Если вы дошли до этого этапа, значит формат вам действительно интересен. "
-            "Самый полезный следующий шаг — коротко обсудить вашу ситуацию: локацию, бюджет и ожидания. "
-            "Так становится понятно, насколько Maison de Café подходит именно вам, без теории и лишних обещаний. "
+        "contacts_next": (
+            "Если вы дошли до этого этапа, значит формат вам действительно интересен. Самый полезный следующий шаг — коротко обсудить вашу ситуацию: "
+            "локацию, бюджет и ожидания. Так становится понятно, насколько Maison de Café подходит именно вам, без теории и лишних обещаний. "
             "Можем либо оформить заявку и разобрать всё персонально, либо вернуться к цифрам и ещё раз спокойно пройтись по окупаемости."
         ),
     },
+    # For UA/EN/FR we keep consistent meaning, not adding new facts.
     "UA": {
         "what": (
-            "Це хороший запит — з нього зазвичай і починається знайомство. "
-            "Maison de Café — це готова точка самообслуговування «під ключ» у Бельгії. "
+            "Хороший запит — з нього зазвичай і починається знайомство. Maison de Café — це готова точка самообслуговування «під ключ» у Бельгії. "
             "Ви отримуєте професійний автомат Jetinno JL-300, фірмову стійку, систему контролю та стартовий набір інгредієнтів, "
-            "а також навчання і супровід запуску. "
-            "Формат розрахований на швидкий старт без досвіду та роботу без персоналу. "
-            "Далі логічно або розібрати вартість запуску, або перейти до окупності та цифр."
+            "а також навчання і супровід запуску. Формат розрахований на швидкий старт без досвіду та роботу без персоналу. "
+            "Далі логічно або розібрати вартість запуску, або перейти до окупності й реальних цифр."
         ),
         "price": (
-            "Це хороший запит, давайте детально розберемо це питання. "
-            "Базова вартість запуску точки Maison de Café в Бельгії — 9 800 €. "
-            "У цю суму входить Jetinno JL-300, фірмова стійка, телеметрія, стартовий набір інгредієнтів, навчання та повний запуск. "
-            "Це не класична франшиза з пакетами та прихованими платежами — ви платите за конкретне обладнання і сервіс. "
-            "Окремо зазвичай лишаються тільки витрати, що залежать від вашої ситуації, наприклад оренда локації або електрика. "
+            "Це найлогічніше питання — і тут важливо одразу говорити чесно. Базова вартість запуску точки Maison de Café в Бельгії — 9 800 €. "
+            "У суму входить Jetinno JL-300, фірмова стійка, телеметрія, стартовий набір інгредієнтів, навчання та повний запуск. "
+            "Це не франшиза з пакетами та прихованими платежами — ви платите за конкретне обладнання та сервіс. "
+            "Окремо зазвичай враховуються лише речі, що залежать від вашої ситуації, наприклад оренда локації або електрика. "
             "Далі логічно або подивитися окупність, або обговорити вашу майбутню локацію."
         ),
         "payback": (
-            "Це хороший запит, давайте детально розберемо це питання. "
-            "У базовій моделі Maison de Café середня маржа з чашки — близько 1,8 €, а типовий обсяг — приблизно 35 чашок на день. "
-            "Це дає валову маржу близько 1 900 € на місяць, з якої після стандартних витрат часто лишається близько 1 200–1 300 € чистого результату. "
-            "У середньому окупність виходить близько 9–12 місяців, але реальний результат залежить від локації і потоку людей. "
+            "Без розуміння цифр немає сенсу йти далі. У базовій моделі Maison de Café середня маржа з чашки — близько 1,8 €, "
+            "а типовий обсяг — приблизно 35 чашок на день. Це дає валову маржу близько 1 900 € на місяць, "
+            "з якої після стандартних витрат зазвичай лишається близько 1 200–1 300 € чистого прибутку. "
+            "Окупність у середньому — 9–12 місяців, але реальний результат залежить від локації та потоку людей. "
             "Можемо розібрати конкретне місце або перейти до умов співпраці."
         ),
         "terms": (
-            "Це хороший запит, давайте детально розберемо це питання. "
-            "Maison de Café — це не класична франшиза з паушальними внесками та жорсткими правилами. "
-            "Це партнерська модель: ви інвестуєте в обладнання і керуєте точкою, а ми забезпечуємо продукт, стандарти якості, навчання і підтримку на старті. "
-            "У вас залишається свобода у виборі локації та управлінні бізнесом. "
-            "Можемо обговорити вашу ідею або перейти до наступного кроку."
+            "Важливий момент — тут часто бувають неправильні очікування. Maison de Café — це не класична франшиза з жорсткими правилами та паушальними внесками. "
+            "Це партнерська модель: ви інвестуєте в обладнання та керуєте точкою, а ми забезпечуємо продукт, стандарти якості, навчання і підтримку на старті. "
+            "У вас залишається свобода у виборі локації та управлінні бізнесом. Можемо обговорити вашу ідею або перейти до наступного кроку."
         ),
-        "contacts": (
-            "Це хороший запит, давайте детально розберемо це питання. "
-            "Якщо ви дійшли до цього етапу — значить формат вам справді цікавий. "
-            "Найкорисніший наступний крок — коротко обговорити вашу ситуацію: локацію, бюджет і очікування. "
-            "Так стає зрозуміло, чи підходить Maison de Café саме вам, без теорії і зайвих обіцянок. "
-            "Можемо або залишити заявку і розібрати все персонально, або повернутися до цифр і спокійно пройтися по окупності."
+        "contacts_next": (
+            "Якщо ви дійшли до цього етапу, значить формат вам справді цікавий. Найкорисніший наступний крок — коротко обговорити вашу ситуацію: "
+            "локацію, бюджет і очікування. Так стає зрозуміло, чи підходить Maison de Café саме вам — без теорії та зайвих обіцянок. "
+            "Можемо або оформити заявку і розібрати все персонально, або повернутися до цифр і ще раз спокійно пройтися по окупності."
         ),
     },
     "EN": {
         "what": (
-            "That’s a good question — it’s usually how the conversation starts. "
-            "Maison de Café is a turnkey self-service coffee point in Belgium. "
-            "You get a Jetinno JL-300 machine, a branded stand, a control system, and a starter set of ingredients, "
-            "plus training and launch support. "
+            "Good question — that’s usually where the conversation starts. Maison de Café is a turnkey self-service point in Belgium. "
+            "You get a professional Jetinno JL-300 machine, a branded stand, a control system and a starter set of ingredients, plus training and launch support. "
             "It’s designed for a fast start without prior coffee-business experience and works without staff. "
-            "Next, it makes sense to discuss either the opening cost or payback and real numbers."
+            "Next, it makes sense to either discuss the launch cost or move straight to payback and real numbers."
         ),
         "price": (
-            "That’s a good question — let’s break it down clearly. "
-            "The base launch cost for a Maison de Café point in Belgium is 9 800 €. "
-            "It includes the Jetinno JL-300, branded stand, telemetry, starter ingredients, training, and full launch support. "
-            "This is not a classic franchise with packages or hidden fees — you pay for specific equipment and service. "
-            "Separate costs usually depend only on your situation, such as rent or electricity. "
-            "Next, we can look at payback or discuss your future location."
+            "This is the most logical question, and it’s important to be upfront. The base cost to launch a Maison de Café point in Belgium is 9 800 €. "
+            "It includes the Jetinno JL-300, branded stand, telemetry, a starter set of ingredients, training and a full launch. "
+            "This is not a classic franchise with packages and hidden fees — you pay for specific equipment and service. "
+            "Separate costs usually depend on your situation (for example, rent or electricity). "
+            "Next, we can either look at payback or discuss your target location."
         ),
         "payback": (
-            "That’s a good question — let’s break it down clearly. "
-            "In the base model, the average margin per cup is about 1.8 €, and a typical volume is around 35 cups/day. "
-            "That’s roughly 1 900 € gross margin per month, and after standard costs it often leaves around 1 200–1 300 € net. "
-            "Average payback is about 9–12 months, but the real result always depends on location traffic. "
-            "We can assess a specific location or move to partnership terms."
+            "Without numbers, there’s no point moving forward. In the base Maison de Café model, the average margin per cup is about 1.8 €, "
+            "and a typical volume is around 35 cups/day. That gives roughly 1 900 € gross margin per month, "
+            "and after standard monthly costs it often leaves around 1 200–1 300 € net profit. "
+            "Payback is typically 9–12 months, but the real result depends on the location and traffic. "
+            "We can review a specific spot or move to partnership terms."
         ),
         "terms": (
-            "That’s a good question — let’s break it down clearly. "
-            "Maison de Café is not a classic franchise with entry fees and rigid rules. "
-            "It’s a partnership model: you invest in the equipment and manage the point, and we provide product, quality standards, training, and launch support. "
-            "You keep flexibility in choosing the location and running the business. "
-            "We can discuss your idea or move to the next step."
+            "This is an important point — expectations are often wrong here. Maison de Café is not a classic franchise with strict rules and entry fees. "
+            "It’s a partnership model: you invest in equipment and manage the point, while we provide product, quality standards, training and launch support. "
+            "You keep freedom in choosing the location and managing the business. We can discuss your idea or move to the next step."
         ),
-        "contacts": (
-            "That’s a good question — let’s break it down clearly. "
-            "If you reached this point, the format is genuinely interesting for you. "
-            "The most useful next step is a short talk about your situation: location, budget, and expectations. "
-            "That’s how we confirm fit without theory or empty promises. "
-            "We can either submit a request and go personal, or return to the numbers and calmly review payback again."
+        "contacts_next": (
+            "If you’ve reached this stage, the format is clearly interesting to you. The most useful next step is to briefly discuss your situation: "
+            "location, budget and expectations. That makes it clear whether Maison de Café fits you — without theory or empty promises. "
+            "We can either submit a request and go through it personally, or return to the numbers and calmly review payback again."
         ),
     },
     "FR": {
         "what": (
-            "C’est une bonne question — c’est souvent comme ça que la discussion commence. "
-            "Maison de Café est un point café en libre-service « clé en main » en Belgique. "
-            "Vous recevez une machine Jetinno JL-300, un stand de marque, un système de contrôle et un kit de démarrage d’ingrédients, "
-            "ainsi que la formation et l’accompagnement au lancement. "
-            "Le format est pensé pour démarrer vite, sans expérience, et fonctionner sans personnel. "
-            "Ensuite, il est logique de parler soit du coût de lancement, soit de la rentabilité et des chiffres."
+            "Bonne question — c’est souvent ainsi que l’échange commence. Maison de Café est un point en libre-service « clé en main » en Belgique. "
+            "Vous recevez une machine professionnelle Jetinno JL-300, un stand de marque, un système de contrôle et un kit de démarrage d’ingrédients, "
+            "ainsi que la formation et l’accompagnement au lancement. Le format permet de démarrer vite sans expérience et fonctionne sans personnel. "
+            "Ensuite, il est logique soit de voir le coût de lancement, soit de passer à la rentabilité et aux chiffres."
         ),
         "price": (
-            "C’est une bonne question — regardons-la clairement. "
-            "Le coût de base pour lancer un point Maison de Café en Belgique est de 9 800 €. "
-            "Cela inclut la Jetinno JL-300, le stand, la télémétrie, le kit d’ingrédients, la formation et le lancement. "
-            "Ce n’est pas une franchise classique avec packs et frais cachés — vous payez pour un équipement et un service précis. "
-            "Les coûts séparés dépendent généralement de votre situation (loyer, électricité). "
-            "Ensuite, on peut regarder la rentabilité ou discuter de votre futur emplacement."
+            "C’est la question la plus logique, et il faut être transparent. Le coût de base pour lancer un point Maison de Café en Belgique est de 9 800 €. "
+            "Cela inclut la Jetinno JL-300, le stand, la télémétrie, le kit d’ingrédients, la formation et le lancement complet. "
+            "Ce n’est pas une franchise classique avec packs et frais cachés — vous payez pour un équipement et un service concrets. "
+            "Les coûts séparés dépendent généralement de votre situation (par exemple loyer ou électricité). "
+            "Ensuite, on peut soit regarder la rentabilité, soit discuter de votre futur emplacement."
         ),
         "payback": (
-            "C’est une bonne question — regardons-la clairement. "
-            "Dans le modèle de base, la marge moyenne par tasse est d’environ 1,8 €, avec un volume типique d’environ 35 tasses/jour. "
-            "Cela donne environ 1 900 € de marge brute par mois, et après les coûts standards il reste souvent autour de 1 200–1 300 € net. "
-            "Le retour sur investissement est en moyenne de 9–12 mois, mais le résultat dépend du flux de l’emplacement. "
-            "On peut analyser un lieu précis ou passer aux conditions de partenariat."
+            "Sans chiffres, cela n’a pas de sens d’aller plus loin. Dans le modèle de base Maison de Café, la marge moyenne par tasse est d’environ 1,8 €, "
+            "et le volume типique est d’environ 35 tasses/jour. Cela donne environ 1 900 € de marge brute par mois, "
+            "et après les coûts mensuels standard il reste souvent autour de 1 200–1 300 € de bénéfice net. "
+            "Le retour sur investissement est en général de 9–12 mois, mais le résultat réel dépend de l’emplacement et du flux. "
+            "On peut analyser un lieu concret ou passer aux conditions de partenariat."
         ),
         "terms": (
-            "C’est une bonne question — regardons-la clairement. "
-            "Maison de Café n’est pas une franchise classique avec droits d’entrée et règles rigides. "
-            "C’est un modèle partenaire : vous investissez dans l’équipement et gérez le point, et nous fournissons le produit, les standards qualité, la formation et l’accompagnement. "
-            "Vous gardez de la flexibilité sur l’emplacement et la gestion. "
-            "On peut discuter de votre idée ou passer à la prochaine étape."
+            "Point important — les attentes sont souvent incorrectes ici. Maison de Café n’est pas une franchise classique avec règles strictes et droits d’entrée. "
+            "C’est un modèle partenaire : vous investissez dans l’équipement et vous gérez le point, et nous fournissons le produit, les standards qualité, "
+            "la formation et l’accompagnement au lancement. Vous gardez la liberté de choisir l’emplacement et de gérer le business. "
+            "On peut discuter de votre idée ou passer à l’étape suivante."
         ),
-        "contacts": (
-            "C’est une bonne question — regardons-la clairement. "
-            "Si vous êtes arrivé à ce stade, c’est que le format vous intéresse réellement. "
-            "La prochaine étape la plus utile est d’échanger brièvement sur votre situation : emplacement, budget et attentes. "
-            "C’est comme ça qu’on valide l’adéquation sans théorie ni promesses inutiles. "
-            "On peut soit laisser une demande, soit revenir aux chiffres et revoir la rentabilité calmement."
+        "contacts_next": (
+            "Si vous en êtes arrivé là, c’est que le format vous intéresse vraiment. La prochaine étape la plus utile est de discuter brièvement de votre situation : "
+            "emplacement, budget et attentes. Cela permet de savoir si Maison de Café vous convient — sans théorie ni promesses vides. "
+            "On peut soit laisser une demande et tout revoir персонно, soit revenir aux chiffres et refaire calmement la rentabilité."
         ),
     },
 }
 
 
-def gold_lang(lang: str) -> str:
-    return lang if lang in GOLD else "RU"
+def norm_lang(lang: str) -> str:
+    return lang if lang in LANGS else "RU"
 
 
-# ==========================================================
-# KEYBOARDS
-# ==========================================================
-def reply_menu(lang: str) -> ReplyKeyboardMarkup:
+# =========================
+# MENU (7 reply-buttons) + inline language
+# =========================
+MENU_LABELS = {
+    "UA": {
+        "what": "☕ Що таке Maison de Café?",
+        "price": "💶 Скільки коштує відкрити?",
+        "payback": "📈 Окупність і прибуток",
+        "terms": "🤝 Умови співпраці",
+        "contacts": "📞 Контакти / наступний крок",
+        "presentation": "📄 Презентація",
+        "lang": "🌍 Мова",
+    },
+    "RU": {
+        "what": "☕ Что такое Maison de Café?",
+        "price": "💶 Сколько стоит открыть?",
+        "payback": "📈 Окупаемость и прибыль",
+        "terms": "🤝 Условия сотрудничества",
+        "contacts": "📞 Контакты / следующий шаг",
+        "presentation": "📄 Презентация",
+        "lang": "🌍 Язык",
+    },
+    "EN": {
+        "what": "☕ What is Maison de Café?",
+        "price": "💶 Opening cost",
+        "payback": "📈 Payback & profit",
+        "terms": "🤝 Partnership terms",
+        "contacts": "📞 Contacts / next step",
+        "presentation": "📄 Presentation",
+        "lang": "🌍 Language",
+    },
+    "FR": {
+        "what": "☕ Qu’est-ce que Maison de Café ?",
+        "price": "💶 Coût de lancement",
+        "payback": "📈 Rentabilité & profit",
+        "terms": "🤝 Conditions",
+        "contacts": "📞 Contacts / prochaine étape",
+        "presentation": "📄 Présentation",
+        "lang": "🌍 Langue",
+    },
+}
+
+# Build reverse map from button text -> key
+def build_reverse_menu_map() -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    for lang, labels in MENU_LABELS.items():
+        for key, txt in labels.items():
+            m[txt] = key
+    return m
+
+
+REVERSE_MENU_MAP = build_reverse_menu_map()
+
+
+def reply_menu(lang: str):
+    """
+    ReplyKeyboardMarkup must be sent only on /start and after language switch.
+    IMPORTANT: We do NOT send ReplyKeyboardRemove() later.
+    Using one_time_keyboard=True gives the "square" to bring it back.
+    """
+    from telegram import ReplyKeyboardMarkup  # local import to keep top clean
+
     L = MENU_LABELS.get(lang, MENU_LABELS["RU"])
-    # 7 buttons (include presentation)
+    # 7 buttons total
     keyboard = [
         [L["what"]],
         [L["price"]],
         [L["payback"]],
         [L["terms"]],
-        [L["presentation"]],
         [L["contacts"]],
-        [L["lead"], L["lang"]],
+        [L["presentation"]],
+        [L["lang"]],
     ]
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        one_time_keyboard=True,   # Telegram usually hides after press (we also remove explicitly)
-        input_field_placeholder="Напишите вопрос или выберите пункт меню…",
+        one_time_keyboard=True,   # key UX: hides after tap, but keeps square to reopen
+        selective=False,
+        is_persistent=False,
     )
 
 
-def lang_inline_keyboard() -> InlineKeyboardMarkup:
+def inline_lang_keyboard() -> InlineKeyboardMarkup:
     kb = [
-        [InlineKeyboardButton(LANG_LABELS["UA"], callback_data="l:UA"),
-         InlineKeyboardButton(LANG_LABELS["RU"], callback_data="l:RU")],
-        [InlineKeyboardButton(LANG_LABELS["EN"], callback_data="l:EN"),
-         InlineKeyboardButton(LANG_LABELS["FR"], callback_data="l:FR")],
+        [
+            InlineKeyboardButton(LANG_LABELS["UA"], callback_data="l:UA"),
+            InlineKeyboardButton(LANG_LABELS["RU"], callback_data="l:RU"),
+        ],
+        [
+            InlineKeyboardButton(LANG_LABELS["EN"], callback_data="l:EN"),
+            InlineKeyboardButton(LANG_LABELS["FR"], callback_data="l:FR"),
+        ],
     ]
     return InlineKeyboardMarkup(kb)
 
 
-# ==========================================================
-# SANITY GUARDS
-# ==========================================================
+# =========================
+# Anti-hallucination guards (LLM)
+# =========================
 BANNED_PATTERNS = [
+    r"\bроялти\b",
+    r"\bпаушальн",
+    r"\bfranchise fee\b",
+    r"\broyalt",
+    r"\bentry fee\b",
+    r"\bпакет\b",
     r"\b49\s*000\b",
     r"\b55\s*000\b",
     r"\b150\s*000\b",
-    r"\b1\s*500\s*[–-]\s*2\s*000\b",
-    r"\bпаушальн",
-    r"\bроялти\b",
 ]
-
 
 def looks_like_legacy_franchise(text: str) -> bool:
     t = (text or "").lower()
     return any(re.search(p, t) for p in BANNED_PATTERNS)
 
 
-# ==========================================================
-# THREAD
-# ==========================================================
-async def ensure_thread(user: UserState) -> str:
-    if user.thread_id:
-        return user.thread_id
+# =========================
+# Calculator (deterministic)
+# =========================
+MARGIN_PER_CUP = 1.8
+MAX_CUPS_PER_DAY = 200
+MONTH_DAYS = 30
+EXPENSES_MIN = 450
+EXPENSES_MAX = 600
+
+def parse_cups_per_day(text: str) -> Optional[int]:
+    """
+    Extract cups/day from user text.
+    Accepts: '35 чашек', '40 cups', '50 в день', 'до 200', etc.
+    """
+    if not text:
+        return None
+    t = text.lower()
+
+    # If user writes: "35 чашек" or "35 cups"
+    m = re.search(r"\b(\d{1,3})\b\s*(чаш|cup|cups)\b", t)
+    if m:
+        n = int(m.group(1))
+        return n
+
+    # If user writes: "35 в день" / "35 в сутки"
+    m = re.search(r"\b(\d{1,3})\b\s*(в\s*(день|сутки)|per\s*day|/day)\b", t)
+    if m:
+        n = int(m.group(1))
+        return n
+
+    # If user asks "если 35" in profit context:
+    m = re.search(r"\b(\d{1,3})\b", t)
+    if m:
+        n = int(m.group(1))
+        # Keep it only if it looks like a cups question
+        if any(w in t for w in ["чаш", "cups", "в день", "per day", "зараб", "прибыл", "прибут", "profit", "rentab", "сколько буду"]):
+            return n
+
+    return None
+
+
+def is_profit_question(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return any(w in t for w in [
+        "сколько буду", "сколько я буду", "сколько заработ", "прибыл", "прибыль",
+        "прибут", "profit", "rentab", "rentabilité", "окуп", "окупа",
+        "модель", "бизнес-модель", "business model"
+    ])
+
+
+def calc_profit_message(lang: str, cups_per_day: int) -> str:
+    lang = norm_lang(lang)
+    cups = max(0, min(int(cups_per_day), MAX_CUPS_PER_DAY))
+
+    gross_month = cups * MARGIN_PER_CUP * MONTH_DAYS
+    net_min = gross_month - EXPENSES_MAX
+    net_max = gross_month - EXPENSES_MIN
+
+    # Friendly formatting
+    def eur(x: float) -> str:
+        return f"{int(round(x)):,}".replace(",", " ")
+
+    if lang == "UA":
+        return (
+            f"Ок, порахую по вашій цифрі.\n"
+            f"• Чашок/день: {cups}\n"
+            f"• Середня маржа/чашка: {MARGIN_PER_CUP} €\n"
+            f"• Валова маржа/місяць (≈{MONTH_DAYS} днів): ~{eur(gross_month)} €\n"
+            f"• Орієнтовно «чистими» після витрат {EXPENSES_MIN}–{EXPENSES_MAX} €/міс: ~{eur(net_min)}–{eur(net_max)} €\n\n"
+            f"Хочете — скажіть тип локації (лікарня/ТЦ/бізнес-центр) і я підкажу, який обсяг чашок реалістичний саме там."
+        )
+    if lang == "EN":
+        return (
+            f"OK — let’s calculate with your number.\n"
+            f"• Cups/day: {cups}\n"
+            f"• Avg margin/cup: {MARGIN_PER_CUP} €\n"
+            f"• Gross margin/month (≈{MONTH_DAYS} days): ~{eur(gross_month)} €\n"
+            f"• Estimated net after {EXPENSES_MIN}–{EXPENSES_MAX} €/month costs: ~{eur(net_min)}–{eur(net_max)} €\n\n"
+            f"Tell me the location type (hospital / mall / business center) and I’ll comment what cup volume is realistic there."
+        )
+    if lang == "FR":
+        return (
+            f"OK — je calcule avec votre chiffre.\n"
+            f"• Tasses/jour : {cups}\n"
+            f"• Marge moyenne/tasse : {MARGIN_PER_CUP} €\n"
+            f"• Marge brute/mois (≈{MONTH_DAYS} jours) : ~{eur(gross_month)} €\n"
+            f"• Estimation net après {EXPENSES_MIN}–{EXPENSES_MAX} €/mois de coûts : ~{eur(net_min)}–{eur(net_max)} €\n\n"
+            f"Dites-moi le type d’emplacement (hôpital / centre commercial / business center) et je vous dirai quel volume est réaliste."
+        )
+    # RU default
+    return (
+        f"Ок, считаю по вашей цифре.\n"
+        f"• Чашек/день: {cups}\n"
+        f"• Средняя маржа/чашка: {MARGIN_PER_CUP} €\n"
+        f"• Валовая маржа/месяц (≈{MONTH_DAYS} дней): ~{eur(gross_month)} €\n"
+        f"• Ориентировочно «чистыми» после расходов {EXPENSES_MIN}–{EXPENSES_MAX} €/мес: ~{eur(net_min)}–{eur(net_max)} €\n\n"
+        f"Хотите — скажите тип локации (больница/ТЦ/бизнес-центр), и я подскажу, какой объём чашек реально ожидать именно там."
+    )
+
+
+# =========================
+# Assistant thread handling
+# =========================
+async def ensure_thread(u: UserState) -> str:
+    if u.thread_id:
+        return u.thread_id
     thread = await asyncio.to_thread(client.beta.threads.create)
-    user.thread_id = thread.id
+    u.thread_id = thread.id
     save_state()
     return thread.id
 
 
-# ==========================================================
-# DRAFT INSTRUCTIONS (for Assistant run)
-# ==========================================================
-def _draft_instructions(lang: str) -> str:
+def draft_instructions(lang: str) -> str:
+    lang = norm_lang(lang)
     if lang == "UA":
         return (
             "Ти — Max, консультант Maison de Café. Відповідай по-людськи, спокійно, впевнено. "
             "Не згадуй бази знань/файли/пошук. "
-            "НЕ вигадуй цифри, пакети, роялті, паушальні внески або формати «класичної франшизи». "
-            "Якщо для точної відповіді бракує даних — поясни це просто і задай 1 коротке уточнення."
+            "НЕ вигадуй цифри, пакети, роялті, паушальні внески або «класичну франшизу». "
+            "Якщо даних бракує — задай 1 коротке уточнення."
         )
     if lang == "EN":
         return (
             "You are Max, a Maison de Café consultant. Speak naturally and confidently. "
             "Do not mention knowledge bases/files/search. "
-            "Do NOT invent numbers, packages, royalties, franchise fees, or generic coffee-shop templates. "
-            "If details are needed, explain simply and ask 1 short clarifying question."
+            "Do NOT invent numbers, packages, royalties, or classic franchise templates. "
+            "If details are missing, ask 1 short clarifying question."
         )
     if lang == "FR":
         return (
             "Tu es Max, consultant Maison de Café. Réponds de façon humaine et sûre. "
-            "Ne mentionne pas de base de connaissances/fichiers/recherche. "
-            "N’invente pas de chiffres, de packs, de royalties ou de « franchise classique ». "
-            "Si des détails manquent, explique simplement et pose 1 question courte."
+            "Ne mentionne pas base de connaissances/fichiers/recherche. "
+            "N’invente pas de chiffres, packs, royalties ou franchise classique. "
+            "S’il manque des détails, pose 1 question courte."
         )
-    # RU
     return (
         "Ты — Max, консультант Maison de Café. Отвечай по-человечески, спокойно, уверенно. "
         "Не упоминай базы знаний/файлы/поиск. "
-        "НЕ придумывай цифры, пакеты, роялти, паушальные взносы или шаблоны «классической франшизы». "
-        "Если для точного ответа не хватает данных — объясни это просто и задай 1 короткий уточняющий вопрос."
+        "НЕ придумывай цифры, пакеты, роялти, паушальные взносы или «классическую франшизу». "
+        "Если данных не хватает — задай 1 короткий уточняющий вопрос."
     )
 
 
-# ==========================================================
-# PROFIT CALCULATOR (deterministic)
-# 1.8 * cups/day * 30 - expenses (450..600)
-# cups: 1..200
-# ==========================================================
-def _parse_cups_per_day(text: str) -> Optional[int]:
-    """
-    Extract cups/day from user text if present.
-    Accepts: "30 чашек", "40 cups", "50/day", "50 в день", etc.
-    Chooses the most plausible number 1..200.
-    """
-    if not text:
-        return None
-    t = text.lower()
-
-    # explicit patterns
-    m = re.search(r"(\d{1,3})\s*(?:чаш|cups|cup)\b", t)
-    if m:
-        v = int(m.group(1))
-        return v if 1 <= v <= 200 else None
-
-    m = re.search(r"(\d{1,3})\s*(?:в\s*день|/day|per\s*day|на\s*день)\b", t)
-    if m:
-        v = int(m.group(1))
-        return v if 1 <= v <= 200 else None
-
-    # fallback: any number in range 1..200, but avoid years like 2024
-    nums = [int(x) for x in re.findall(r"\b(\d{1,3})\b", t)]
-    nums = [n for n in nums if 1 <= n <= 200]
-    if not nums:
-        return None
-    # Prefer numbers close to typical ranges (10..120)
-    nums.sort(key=lambda x: (0 if 10 <= x <= 120 else 1, abs(x - 35)))
-    return nums[0]
-
-
-def _looks_like_profit_question(text: str) -> bool:
-    if not text:
-        return False
-    t = text.lower()
-    keys = [
-        "сколько заработ", "сколько я буду", "сколько получ", "прибыл", "прибут",
-        "profit", "earn", "income", "rentab", "окупить", "окуп", "model",
-        "бизнес-модель", "сколько в месяц", "сколько в месяц", "gross", "net"
-    ]
-    return any(k in t for k in keys)
-
-
-def _profit_answer(lang: str, cups: Optional[int]) -> str:
-    gl = gold_lang(lang)
-
-    if cups is None:
-        # One short question, but still helpful
-        if gl == "UA":
-            return (
-                "Це хороший запит, давайте детально розберемо це питання. "
-                "Скільки чашок на день ви плануєте продавати (від 1 до 200)? "
-                "Я порахую модель: 1,8 € маржа × чашки × 30 днів мінус середні витрати 450–600 €."
-            )
-        if gl == "EN":
-            return (
-                "That’s a good question — let’s calculate it properly. "
-                "How many cups per day do you expect (1 to 200)? "
-                "I’ll calculate: 1.8 € margin × cups × 30 days minus typical monthly costs of 450–600 €."
-            )
-        if gl == "FR":
-            return (
-                "Bonne question — calculons ça proprement. "
-                "Combien de tasses par jour visez-vous (1 à 200) ? "
-                "Je calcule : marge 1,8 € × tasses × 30 jours moins les coûts mensuels moyens 450–600 €."
-            )
-        return (
-            "Это хороший вопрос, давайте детально разберем этот вопрос. "
-            "Сколько чашек в день вы планируете продавать (от 1 до 200)? "
-            "Я посчитаю модель: 1,8 € маржа × чашки × 30 дней минус средние расходы 450–600 €."
-        )
-
-    margin_per_cup = 1.8
-    days = 30
-    gross = margin_per_cup * cups * days
-    net_low_cost = gross - 600
-    net_high_cost = gross - 450
-
-    # Format amounts without overcomplicating
-    def euro(x: float) -> str:
-        return f"{x:,.0f} €".replace(",", " ")
-
-    if gl == "UA":
-        return (
-            "Це хороший запит, давайте детально розберемо це питання. "
-            f"Якщо продавати {cups} чашок на день: 1,8 € × {cups} × 30 = приблизно {euro(gross)} валової маржі на місяць. "
-            f"Після середніх витрат 450–600 € залишається орієнтовно {euro(net_low_cost)}–{euro(net_high_cost)} на місяць. "
-            "Якщо хочете — скажіть локацію (місто/район) і я підкажу, на що звернути увагу, щоб ці цифри були реалістичними."
-        )
-    if gl == "EN":
-        return (
-            "That’s a good question — let’s calculate it properly. "
-            f"If you sell {cups} cups/day: 1.8 € × {cups} × 30 ≈ {euro(gross)} gross margin/month. "
-            f"After typical costs of 450–600 €, you’re at roughly {euro(net_low_cost)}–{euro(net_high_cost)} per month. "
-            "If you share the city/area and location type, I’ll help you sanity-check the assumptions."
-        )
-    if gl == "FR":
-        return (
-            "Bonne question — calculons ça proprement. "
-            f"À {cups} tasses/jour : 1,8 € × {cups} × 30 ≈ {euro(gross)} de marge brute/mois. "
-            f"Après des coûts moyens de 450–600 €, il reste environ {euro(net_low_cost)}–{euro(net_high_cost)} par mois. "
-            "Si vous me dites la ville/quartier et le type d’emplacement, je vous aide à valider ces hypothèses."
-        )
-    return (
-        "Это хороший вопрос, давайте детально разберем этот вопрос. "
-        f"Если продавать {cups} чашек в день: 1,8 € × {cups} × 30 = примерно {euro(gross)} валовой маржи в месяц. "
-        f"После средних расходов 450–600 € остаётся ориентировочно {euro(net_low_cost)}–{euro(net_high_cost)} в месяц. "
-        "Если хотите — скажите город/район и тип локации, и я помогу проверить реалистичность этих цифр."
-    )
-
-
-# ==========================================================
-# ANSWER PIPELINE (2-PASS)
-# PASS 1: Assistant + KB
-# PASS 2: Verifier rewrite (no KB)
-# ==========================================================
-# For Assistant answers, keep the “no random numbers” guard,
-# but we allow calculator outputs by bypassing assistant.
-
-_ALLOWED_NUMBER_PATTERNS = [
-    r"\b9\s*800\b", r"\b9800\b",
-    r"\b1[\.,]8\b",
-    r"\b35\b",
-    r"\b1\s*900\b", r"\b1900\b",
-    r"\b1\s*200\b", r"\b1200\b",
-    r"\b1\s*300\b", r"\b1300\b",
-    r"\b9\s*[–-]\s*12\b",
-]
-
-
-def _has_disallowed_numbers(text: str) -> bool:
-    if not text:
-        return False
-    tmp = text
-    for p in _ALLOWED_NUMBER_PATTERNS:
-        tmp = re.sub(p, "", tmp)
-    return bool(re.search(r"\d", tmp))
-
-
-async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
-    user = get_user(user_id)
-    thread_id = await ensure_thread(user)
+async def assistant_draft(user_id: str, text: str, lang: str) -> str:
+    u = get_user(user_id)
+    thread_id = await ensure_thread(u)
 
     await asyncio.to_thread(
         client.beta.threads.messages.create,
         thread_id=thread_id,
         role="user",
-        content=user_text,
+        content=text,
     )
 
     run = await asyncio.to_thread(
         client.beta.threads.runs.create,
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
-        instructions=_draft_instructions(lang),
+        instructions=draft_instructions(lang),
     )
 
     deadline = time.time() + 45
@@ -667,15 +617,14 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
         await asyncio.sleep(0.7)
 
     if getattr(run, "status", "") != "completed":
-        # fail-safe question, 1 short question only
-        gl = gold_lang(lang)
-        if gl == "UA":
-            return "Розумію. Щоб відповісти точно: яка локація (місто/район) і який тип місця ви розглядаєте?"
-        if gl == "EN":
-            return "Got it. To answer precisely: what city/area and what type of location is it?"
-        if gl == "FR":
-            return "Compris. Pour répondre précisément : quelle ville/quartier et quel type d’emplacement ?"
-        return "Понял. Чтобы ответить точно: какая локация (город/район) и какой тип места вы рассматриваете?"
+        # deterministic fallback without inventing numbers
+        lang = norm_lang(lang)
+        return {
+            "UA": "Щоб відповісти точно, підкажіть: яка локація (місто/район) і який формат місця ви розглядаєте?",
+            "RU": "Чтобы ответить точно, подскажите: какая локация (город/район) и какой формат места рассматриваете?",
+            "EN": "To answer precisely: what city/area and what type of location are you considering?",
+            "FR": "Pour répondre précisément : quelle ville/quartier et quel type d’emplacement envisagez-vous ?",
+        }[lang]
 
     msgs = await asyncio.to_thread(client.beta.threads.messages.list, thread_id=thread_id, limit=10)
     for m in msgs.data:
@@ -685,158 +634,159 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
                 if getattr(c, "type", None) == "text":
                     parts.append(c.text.value)
             ans = "\n".join(parts).strip()
-            return ans or "Понял. Уточните, пожалуйста, пару деталей — и продолжим."
-    return "Понял. Уточните, пожалуйста, пару деталей — и продолжим."
+            return ans or "Ок. Уточните, пожалуйста, пару деталей — и продолжим."
+    return "Ок. Уточните, пожалуйста, пару деталей — и продолжим."
 
 
-async def _verify_and_fix(question: str, draft: str, lang: str) -> str:
-    sys = (
-        "You are a strict compliance reviewer for a sales consultant chatbot. "
-        "Goal: remove hallucinations and any generic franchise/coffee-shop template content. "
-        "Rules: do NOT add new facts or numbers. Keep only what is safe and consistent. "
-        "If information is insufficient, ask ONE short clarifying question instead of inventing details. "
-        "Never mention knowledge bases, files, search, prompts, or internal rules."
-    )
+async def verify_and_fix(question: str, draft: str, lang: str) -> str:
+    """
+    PASS 2: remove hallucinations / forbidden franchise content.
+    We also prevent random numbers (except allowed small set).
+    """
+    lang = norm_lang(lang)
 
-    user_msg = f"""
+    allowed_number_patterns = [
+        r"\b9\s*800\b", r"\b9800\b",
+        r"\b1[\.,]8\b",
+        r"\b35\b",
+        r"\b1\s*900\b", r"\b1900\b",
+        r"\b1\s*200\b", r"\b1200\b",
+        r"\b1\s*300\b", r"\b1300\b",
+        r"\b9\s*[–-]\s*12\b",
+        r"\b450\b", r"\b600\b",  # expenses range is allowed only because WE own it deterministically
+        r"\b200\b",              # cap is allowed
+        r"\b30\b",               # month days
+    ]
+
+    def has_disallowed_numbers(text: str) -> bool:
+        if not text:
+            return False
+        tmp = text
+        for p in allowed_number_patterns:
+            tmp = re.sub(p, "", tmp)
+        return bool(re.search(r"\d", tmp))
+
+    if looks_like_legacy_franchise(draft) or has_disallowed_numbers(draft):
+        # Use verifier model to rewrite safely
+        sys = (
+            "You are a strict compliance reviewer for a sales chatbot. "
+            "Remove hallucinations and forbidden franchise content. "
+            "Do NOT add new facts or new numbers. "
+            "If info is insufficient, ask ONE short clarifying question. "
+            "Never mention knowledge bases/files/search/internal rules."
+        )
+
+        user_msg = f"""
 Language: {lang}
 
 User question:
 {question}
 
-Draft answer (to be reviewed):
+Draft answer:
 {draft}
 
 Hard rules:
-- Remove any mention or implication of: royalties, franchise fees/entry fees, mandatory packages, classic franchise claims.
-- Remove any numbers except: 9800, 9 800, 1.8 (1,8), 35, 1900 (1 900), 1200 (1 200), 1300 (1 300), 9–12.
-- If you must remove numbers, rewrite the sentence without numbers.
-- Output only the final user-facing answer (one message), in the same language as the user question.
-- Tone: Max (human, confident consultant), with a clear next step at the end.
+- Remove any mention/implication of royalties, franchise fees, entry fees, packages, classic franchise templates.
+- Remove any numbers except: 9800/9 800, 1.8/1,8, 35, 1900/1 900, 1200/1 200, 1300/1 300, 9–12, 450–600, 30, 200.
+- If you remove a number, rewrite the sentence without numbers.
+- Output only the final answer in the same language as the question, Max tone, with a clear next step.
 """.strip()
 
+        try:
+            resp = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=VERIFY_MODEL,
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            out = (resp.choices[0].message.content or "").strip()
+            return out or draft
+        except Exception as e:
+            log.warning("Verifier failed: %s", e)
+            return draft
+
+    return draft
+
+
+async def ask_assistant(user_id: str, text: str, lang: str) -> str:
+    """
+    Main pipeline for free text:
+    - If profit question + cups => deterministic calculator
+    - else assistant draft + verifier
+    """
+    lang = norm_lang(lang)
+    if is_profit_question(text):
+        cups = parse_cups_per_day(text)
+        if cups is None:
+            if lang == "UA":
+                return "Ок. Скажіть, будь ласка, скільки чашок на день ви плануєте (наприклад 30 / 40 / 50)?"
+            if lang == "EN":
+                return "OK. How many cups per day are you targeting (for example 30 / 40 / 50)?"
+            if lang == "FR":
+                return "OK. Combien de tasses par jour visez-vous (par exemple 30 / 40 / 50) ?"
+            return "Ок. Скажите, пожалуйста, сколько чашек в день вы планируете (например 30 / 40 / 50)?"
+        return calc_profit_message(lang, cups)
+
+    draft = await assistant_draft(user_id=user_id, text=text, lang=lang)
+    fixed = await verify_and_fix(question=text, draft=draft, lang=lang)
+    if looks_like_legacy_franchise(fixed):
+        # safe fallback: ask 1 clarifying question
+        if lang == "UA":
+            return "Щоб відповісти точно, підкажіть: яка локація (тип місця) і ваше місто/район?"
+        if lang == "EN":
+            return "To answer precisely: what type of location and what city/area?"
+        if lang == "FR":
+            return "Pour répondre précisément : quel type d’emplacement et quelle ville/quartier ?"
+        return "Чтобы ответить точно, подскажите: тип локации и город/район?"
+    return fixed
+
+# =========================
+# bot.py (PART 2/2)
+# =========================
+
+# =========================
+# Voice transcription (OpenAI)
+# =========================
+async def transcribe_voice_to_text(file_path: str) -> str:
+    """
+    Uses OpenAI audio transcription.
+    Works with OGG/OPUS typically sent by Telegram.
+    """
     try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=VERIFY_MODEL,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user_msg},
-            ],
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        return out or draft
+        with open(file_path, "rb") as f:
+            tr = await asyncio.to_thread(
+                client.audio.transcriptions.create,
+                model="whisper-1",
+                file=f,
+            )
+        return (getattr(tr, "text", "") or "").strip()
     except Exception as e:
-        log.warning("Verifier failed: %s", e)
-        return draft
+        log.warning("Transcription failed: %s", e)
+        return ""
 
 
-def _final_safety_override(question: str, answer: str, lang: str) -> str:
-    if not answer:
-        gl = gold_lang(lang)
-        return GOLD[gl]["what"]
-
-    if looks_like_legacy_franchise(answer) or _has_disallowed_numbers(answer):
-        gl = gold_lang(lang)
-        q = (question or "").lower()
-
-        if any(w in q for w in ["сколько", "скільки", "cost", "prix", "цена", "стоим"]):
-            return GOLD[gl]["price"]
-        if any(w in q for w in ["окуп", "окупн", "profit", "rentab", "прибыл", "прибут"]):
-            return GOLD[gl]["payback"]
-        if any(w in q for w in ["услов", "умов", "terms", "партнер", "franch"]):
-            return GOLD[gl]["terms"]
-        return GOLD[gl]["what"]
-
-    return answer
-
-
-async def ask_assistant(user_id: str, user_text: str, lang: str) -> str:
-    # Deterministic calculator bypass (fixes your complaint about “расплывчато”)
-    if _looks_like_profit_question(user_text):
-        cups = _parse_cups_per_day(user_text)
-        return _profit_answer(lang, cups)
-
-    draft = await _assistant_draft(user_id=user_id, user_text=user_text, lang=lang)
-    fixed = await _verify_and_fix(question=user_text, draft=draft, lang=lang)
-    final = _final_safety_override(question=user_text, answer=fixed, lang=lang)
-    return final
-
-
-# ==========================================================
-# VOICE -> TRANSCRIBE
-# ==========================================================
-async def transcribe_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
-    """
-    Downloads voice message and transcribes via OpenAI STT.
-    """
-    if not update.message or not update.message.voice:
-        return None
-
-    try:
-        voice = update.message.voice
-        file = await context.bot.get_file(voice.file_id)
-        tmp_dir = tempfile.mkdtemp(prefix="healthbot_voice_")
-        local_path = os.path.join(tmp_dir, "voice.ogg")
-        await file.download_to_drive(custom_path=local_path)
-
-        def _stt_call() -> str:
-            with open(local_path, "rb") as f:
-                tr = client.audio.transcriptions.create(
-                    model=STT_MODEL,
-                    file=f,
-                )
-            # SDK returns text in tr.text
-            return getattr(tr, "text", "") or ""
-
-        text = await asyncio.to_thread(_stt_call)
-        text = (text or "").strip()
-        return text or None
-
-    except Exception as e:
-        log.warning("Voice transcribe failed: %s", e)
-        return None
-
-
-# ==========================================================
-# HELPERS: typing
-# ==========================================================
-async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    try:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    except Exception:
-        pass
-
-
-# ==========================================================
-# HANDLERS
-# ==========================================================
-def _match_menu_key(lang: str, text: str) -> Optional[str]:
-    """
-    Map clicked reply button label -> internal key.
-    Returns one of: what, price, payback, terms, contacts, lead, lang, presentation
-    """
-    L = MENU_LABELS.get(lang, MENU_LABELS["RU"])
-    for k, v in L.items():
-        if text == v:
-            return k
-    return None
-
-
+# =========================
+# Commands / Handlers
+# =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     u = get_user(user_id)
 
-    # show reply keyboard ONLY on /start
-    msg = {
-        "UA": "Привіт! Я Max, консультант Maison de Café. Оберіть пункт меню або напишіть питання.",
-        "RU": "Привет! Я Max, консультант Maison de Café. Выберите пункт меню или напишите вопрос.",
-        "EN": "Hi! I’m Max, Maison de Café consultant. Choose a menu item or type your question.",
-        "FR": "Bonjour ! Je suis Max, consultant Maison de Café. Choisissez un пункт du menu ou écrivez votre question.",
-    }.get(u.lang, "Привет!")
+    lang = norm_lang(u.lang)
+    if lang == "UA":
+        txt = "Привіт! Я Max, консультант Maison de Café. Оберіть пункт меню або просто напишіть питання."
+    elif lang == "EN":
+        txt = "Hi! I’m Max, Maison de Café consultant. Choose a menu item or just type your question."
+    elif lang == "FR":
+        txt = "Bonjour ! Je suis Max, consultant Maison de Café. Choisissez un пункт du menu ou écrivez votre question."
+    else:
+        txt = "Привет! Я Max, консультант Maison de Café. Выберите пункт меню или напишите вопрос."
 
-    await update.message.reply_text(msg, reply_markup=reply_menu(u.lang))
+    # IMPORTANT: reply keyboard shown ONLY here
+    await update.message.reply_text(txt, reply_markup=reply_menu(lang))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -844,14 +794,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if OWNER_TELEGRAM_ID and user_id != OWNER_TELEGRAM_ID:
         return
     await update.message.reply_text(
-        f"Users: {len(_state)}\nBlocked: {len(_blocked)}\nAssistant: {ASSISTANT_ID}\nToken: {mask_token(TELEGRAM_BOT_TOKEN)}"
+        "STATUS\n"
+        f"Users: {len(_state)}\n"
+        f"Blocked: {len(_blocked)}\n"
+        f"Assistant: {ASSISTANT_ID}\n"
+        f"Token: {mask_token(TELEGRAM_BOT_TOKEN)}\n"
+        f"Presentation file_id set: {'yes' if bool(PRESENTATION_FILE_ID) else 'no'}"
     )
 
 
 async def on_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-
     user_id = str(q.from_user.id)
     if user_id in _blocked:
         return
@@ -860,137 +814,201 @@ async def on_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = q.data or ""
     if not data.startswith("l:"):
         return
+    lang = data.split(":", 1)[1].strip()
+    if lang not in LANGS:
+        return
 
-    lang = data.split(":", 1)[1]
-    if lang in LANGS:
-        u.lang = lang
-        save_state()
+    u.lang = lang
+    save_state()
 
-    # After language change: show reply keyboard again (as agreed)
-    confirm = {"UA": "Мову змінено.", "RU": "Язык изменён.", "EN": "Language updated.", "FR": "Langue mise à jour."}.get(u.lang, "OK")
+    # IMPORTANT: after language change — show reply keyboard again (UX requirement)
+    if lang == "UA":
+        msg = "Мову змінено."
+    elif lang == "EN":
+        msg = "Language updated."
+    elif lang == "FR":
+        msg = "Langue mise à jour."
+    else:
+        msg = "Язык изменён."
+
+    # send message + menu (ONLY here)
+    await q.message.reply_text(msg, reply_markup=reply_menu(lang))
+
+
+async def send_presentation(chat_id: int, context: ContextTypes.DEFAULT_TYPE, lang: str) -> None:
+    lang = norm_lang(lang)
+    if not PRESENTATION_FILE_ID:
+        if lang == "UA":
+            await context.bot.send_message(chat_id=chat_id, text="Презентація ще не підключена. Я можу надіслати її, як тільки додамо файл.")
+        elif lang == "EN":
+            await context.bot.send_message(chat_id=chat_id, text="The presentation is not connected yet. I can send it as soon as we add the file.")
+        elif lang == "FR":
+            await context.bot.send_message(chat_id=chat_id, text="La présentation n’est pas encore connectée. Je peux l’envoyer dès que le fichier est ajouté.")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="Презентация ещё не подключена. Могу отправить, как только добавим файл.")
+        return
+
     try:
-        await q.message.reply_text(confirm, reply_markup=reply_menu(u.lang))
-    except Exception:
-        # Fallback: just send
-        await context.bot.send_message(chat_id=q.message.chat_id, text=confirm, reply_markup=reply_menu(u.lang))
+        await context.bot.send_document(chat_id=chat_id, document=PRESENTATION_FILE_ID)
+    except Exception as e:
+        log.warning("Presentation send failed: %s", e)
+        if lang == "UA":
+            await context.bot.send_message(chat_id=chat_id, text="Не зміг відправити презентацію тут. Напишіть — надішлю іншим способом.")
+        elif lang == "EN":
+            await context.bot.send_message(chat_id=chat_id, text="I couldn't send the file here. Message me and I’ll share it another way.")
+        elif lang == "FR":
+            await context.bot.send_message(chat_id=chat_id, text="Je n’arrive pas à envoyer le fichier ici. Écrivez-moi et je le partagerai autrement.")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="Не получилось отправить файл тут. Напишите — пришлю другим способом.")
 
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def gold(lang: str, key: str) -> str:
+    lang = norm_lang(lang)
+    return GOLD_5.get(lang, GOLD_5["RU"]).get(key, GOLD_5["RU"]["what"])
+
+
+async def handle_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, key: str) -> bool:
     """
-    Single entry point for text + voice.
-    Implements:
-    - Reply menu buttons
-    - Inline language picker only on lang button
-    - After any answer: hide keyboard (square appears)
+    Handles reply-menu buttons.
+    Returns True if handled.
     """
+    u = get_user(user_id)
+    lang = norm_lang(u.lang)
+    chat_id = update.effective_chat.id
+
+    # IMPORTANT: do NOT attach reply keyboard here (UX requirement)
+    if key == "lang":
+        # show inline language picker
+        if lang == "UA":
+            await update.message.reply_text("Оберіть мову:", reply_markup=inline_lang_keyboard())
+        elif lang == "EN":
+            await update.message.reply_text("Choose language:", reply_markup=inline_lang_keyboard())
+        elif lang == "FR":
+            await update.message.reply_text("Choisissez la langue:", reply_markup=inline_lang_keyboard())
+        else:
+            await update.message.reply_text("Выберите язык:", reply_markup=inline_lang_keyboard())
+        return True
+
+    if key == "presentation":
+        await send_presentation(chat_id=chat_id, context=context, lang=lang)
+        return True
+
+    if key == "contacts":
+        # contacts + next step (GOLD #5 core) + contacts block
+        await update.message.reply_text(gold(lang, "contacts_next"))
+        await update.message.reply_text(CONTACTS_TEXT.get(lang, CONTACTS_TEXT["RU"]))
+        return True
+
+    if key == "what":
+        await update.message.reply_text(gold(lang, "what"))
+        return True
+
+    if key == "price":
+        await update.message.reply_text(gold(lang, "price"))
+        return True
+
+    if key == "payback":
+        # GOLD payback + also allow quick calc suggestion (without inventing)
+        await update.message.reply_text(gold(lang, "payback"))
+        if lang == "UA":
+            await update.message.reply_text("Якщо хочете — напишіть вашу ціль по чашках/день (наприклад 30 / 40 / 50), і я порахую модель.")
+        elif lang == "EN":
+            await update.message.reply_text("If you want, tell me your target cups/day (e.g., 30 / 40 / 50) and I’ll calculate the model.")
+        elif lang == "FR":
+            await update.message.reply_text("Si vous voulez, donnez votre objectif en tasses/jour (ex. 30 / 40 / 50) et je calcule le modèle.")
+        else:
+            await update.message.reply_text("Если хотите — напишите вашу цель по чашкам/день (например 30 / 40 / 50), и я посчитаю модель.")
+        return True
+
+    if key == "terms":
+        await update.message.reply_text(gold(lang, "terms"))
+        return True
+
+    return False
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     if user_id in _blocked:
         return
+
     u = get_user(user_id)
-
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return
-
-    # Voice path
-    if update.message and update.message.voice:
-        await show_typing(context, chat_id)
-        spoken = await transcribe_voice(update, context)
-        if not spoken:
-            # Hide keyboard (consistent UX)
-            await update.message.reply_text(
-                {"UA": "Не зміг розпізнати голосове. Спробуйте ще раз або напишіть текстом.",
-                 "RU": "Не смог распознать голосовое. Попробуйте ещё раз или напишите текстом.",
-                 "EN": "I couldn’t transcribe the voice message. Please try again or type your question.",
-                 "FR": "Je n’ai pas pu transcrire le message vocal. Réessayez ou écrivez votre question."}.get(u.lang, "Не смог распознать."),
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return
-
-        await show_typing(context, chat_id)
-        ans = await ask_assistant(user_id=user_id, user_text=spoken, lang=u.lang)
-        await update.message.reply_text(ans, reply_markup=ReplyKeyboardRemove())
-        return
-
-    # Text path
-    text = (update.message.text or "").strip() if update.message else ""
+    lang = norm_lang(u.lang)
+    text = (update.message.text or "").strip()
     if not text:
         return
 
-    # Check if it is one of the 7 reply buttons (by current lang)
-    key = _match_menu_key(u.lang, text)
+    # 1) If user tapped a reply-menu button -> handle deterministically
+    key = REVERSE_MENU_MAP.get(text)
+    if key:
+        handled = await handle_menu_button(update, context, user_id, key)
+        if handled:
+            return
 
-    if key == "lang":
-        # Inline language picker only here
-        await update.message.reply_text(
-            {"UA": "Оберіть мову:", "RU": "Выберите язык:", "EN": "Choose language:", "FR": "Choisissez la langue:"}.get(u.lang, "Choose language:"),
-            reply_markup=lang_inline_keyboard(),
-        )
-        # IMPORTANT: do not remove reply keyboard here; user can still have it until they press one button
-        # But UX requirement says keyboard appears on start and after language change; we keep it as-is.
+    # 2) Free text -> assistant / calculator
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    ans = await ask_assistant(user_id=user_id, text=text, lang=lang)
+    await update.message.reply_text(ans)  # IMPORTANT: no ReplyKeyboardRemove()
+
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    if user_id in _blocked:
         return
 
-    if key == "presentation":
-        if PRESENTATION_FILE_ID:
-            try:
-                await show_typing(context, chat_id)
-                await context.bot.send_document(chat_id=chat_id, document=PRESENTATION_FILE_ID)
-            except Exception as e:
-                log.warning("Presentation send failed: %s", e)
-                await update.message.reply_text(
-                    {"UA": "Не зміг відправити презентацію. Скажіть — і я надішлю іншим способом.",
-                     "RU": "Не получилось отправить презентацию. Скажите — и я пришлю другим способом.",
-                     "EN": "I couldn't send the presentation file here. Tell me and I’ll share it another way.",
-                     "FR": "Je n’arrive pas à envoyer la présentation ici. Dites-moi et je la partagerai autrement."}.get(u.lang, "Couldn't send the presentation."),
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-                return
-            # After action: hide keyboard (square appears)
-            await update.message.reply_text(
-                {"UA": "Готово.", "RU": "Готово.", "EN": "Done.", "FR": "C’est fait."}.get(u.lang, "Done."),
-                reply_markup=ReplyKeyboardRemove(),
-            )
+    u = get_user(user_id)
+    lang = norm_lang(u.lang)
+
+    voice = update.message.voice
+    if not voice:
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    # Download voice
+    try:
+        tg_file = await context.bot.get_file(voice.file_id)
+        tmp_path = f"/tmp/voice_{user_id}_{int(time.time())}.ogg"
+        await tg_file.download_to_drive(custom_path=tmp_path)
+    except Exception as e:
+        log.warning("Voice download failed: %s", e)
+        if lang == "UA":
+            await update.message.reply_text("Не зміг отримати голосове. Спробуйте ще раз або напишіть текстом.")
+        elif lang == "EN":
+            await update.message.reply_text("I couldn't download the voice message. Please try again or send text.")
+        elif lang == "FR":
+            await update.message.reply_text("Je n’ai pas pu récupérer le vocal. Réessayez ou envoyez du texte.")
         else:
-            await update.message.reply_text(
-                {"UA": "Презентація ще не підключена. Додамо файл — і кнопка почне надсилати PDF.",
-                 "RU": "Презентация ещё не подключена. Добавим файл — и кнопка начнёт отправлять PDF.",
-                 "EN": "The presentation is not connected yet. Once we add the file, the button will send the PDF.",
-                 "FR": "La présentation n’est pas encore connectée. Dès qu’on ajoute le fichier, le bouton enverra le PDF."}.get(u.lang, "Presentation not connected yet."),
-                reply_markup=ReplyKeyboardRemove(),
-            )
+            await update.message.reply_text("Не смог получить голосовое. Попробуйте ещё раз или напишите текстом.")
         return
 
-    if key in ("what", "price", "payback", "terms", "contacts"):
-        gl = gold_lang(u.lang)
-        # Contacts button returns gold + contacts line (contacts are allowed as operational info)
-        if key == "contacts":
-            payload = GOLD[gl]["contacts"] + "\n\n" + CONTACTS_TEXT.get(u.lang, CONTACTS_TEXT["RU"])
+    # Transcribe
+    text = await transcribe_voice_to_text(tmp_path)
+    try:
+        os.remove(tmp_path)
+    except Exception:
+        pass
+
+    if not text:
+        if lang == "UA":
+            await update.message.reply_text("Не розпізнав голос. Спробуйте ще раз або напишіть текстом.")
+        elif lang == "EN":
+            await update.message.reply_text("I couldn’t understand the audio. Please try again or send text.")
+        elif lang == "FR":
+            await update.message.reply_text("Je n’ai pas compris l’audio. Réessayez ou envoyez du texte.")
         else:
-            payload = GOLD[gl][key]
-
-        # After any answer to a menu button: hide keyboard (square appears)
-        await update.message.reply_text(payload, reply_markup=ReplyKeyboardRemove())
+            await update.message.reply_text("Не распознал голос. Попробуйте ещё раз или напишите текстом.")
         return
 
-    if key == "lead":
-        txt = {
-            "UA": "Це хороший запит, давайте детально розберемо це питання. Напишіть: 1) місто/район, 2) тип локації, 3) місце вже є чи ви в пошуку.",
-            "RU": "Это хороший вопрос, давайте детально разберем этот вопрос. Напишите: 1) город/район, 2) тип локации, 3) место уже есть или вы в поиске.",
-            "EN": "That’s a good question — let’s break it down. Please tell me: 1) city/area, 2) location type, 3) do you already have a spot or still searching?",
-            "FR": "Bonne question — regardons ça. Dites-moi : 1) ville/quartier, 2) type d’emplacement, 3) vous avez déjà un lieu ou vous cherchez ?",
-        }.get(u.lang, "Ок, уточните детали.")
-        await update.message.reply_text(txt, reply_markup=ReplyKeyboardRemove())
-        return
-
-    # Otherwise: free-form question -> assistant pipeline
-    await show_typing(context, chat_id)
-    ans = await ask_assistant(user_id=user_id, user_text=text, lang=u.lang)
-    await update.message.reply_text(ans, reply_markup=ReplyKeyboardRemove())
+    # Same pipeline
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    ans = await ask_assistant(user_id=user_id, text=text, lang=lang)
+    await update.message.reply_text(ans)
 
 
-# ==========================================================
-# Polling anti-conflict: clear webhook to avoid telegram.error.Conflict
-# ==========================================================
+# =========================
+# Polling safety (avoid webhook conflicts)
+# =========================
 async def post_init(app: Application) -> None:
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -1000,26 +1018,27 @@ async def post_init(app: Application) -> None:
 
 
 def build_app() -> Application:
-    return ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
-
-
-def main() -> None:
-    # Variant B lock
-    acquire_single_instance_lock_or_exit()
-
-    load_state()
-
-    app = build_app()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Inline language callback ONLY
+    # Inline language callbacks
     app.add_handler(CallbackQueryHandler(on_lang_callback, pattern=r"^l:(UA|RU|EN|FR)$"))
 
-    # Text + Voice in one handler
-    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, on_message))
+    # Voice first (so it doesn't fall into text handler)
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
+    # Text (non-command)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    return app
+
+
+def main() -> None:
+    acquire_single_instance_lock()
+    load_state()
+    app = build_app()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
