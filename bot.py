@@ -75,7 +75,7 @@ log.info("Boot: ASSISTANT_ID=%s", ASSISTANT_ID)
 
 
 # =========================
-# SINGLE INSTANCE LOCK (variant B + PID hint)
+# SINGLE INSTANCE LOCK (variant B)
 # =========================
 def acquire_single_instance_lock() -> None:
     """
@@ -85,34 +85,15 @@ def acquire_single_instance_lock() -> None:
     lock_path = os.getenv("BOT_LOCK_PATH", "/tmp/maisondecafe_bot.lock")
     try:
         import fcntl  # Linux/Unix only (Render = OK)
-        fh = open(lock_path, "a+")
-        try:
-            fh.seek(0)
-            existing = fh.read().strip()
-        except Exception:
-            existing = ""
-
+        fh = open(lock_path, "w")
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-        fh.seek(0)
-        fh.truncate()
         fh.write(str(os.getpid()))
         fh.flush()
-
         # Keep reference alive for the process lifetime
         globals()["_LOCK_FH"] = fh
         log.info("Single-instance lock acquired: %s", lock_path)
     except BlockingIOError:
-        pid_hint = None
-        try:
-            with open(lock_path, "r") as f:
-                pid_hint = f.read().strip() or None
-        except Exception:
-            pid_hint = None
-        if pid_hint:
-            log.error("Another bot process is already running (lock busy). PID in lock: %s. Exiting.", pid_hint)
-        else:
-            log.error("Another bot process is already running (lock busy). Exiting.")
+        log.error("Another bot process is already running (lock busy). Exiting.")
         raise SystemExit(0)
     except Exception as e:
         # If lock fails unexpectedly, still allow running (but log it)
@@ -238,7 +219,7 @@ GOLD_5 = {
         "price": (
             "Хороший вопрос, давайте детально разберем. "
             "Базовая стоимость запуска точки Maison de Café в Бельгии составляет 9 800 €. "
-            "В эту сумму входит профессиональный автомат Jetinno JL-300, фирменная стойка, телеметрия, стартовый набор ингредиентов, "
+            "В эту сумму входит профессиональный кофейный автомат Jetinno JL-300, фирменная стойка, телеметрия, стартовый набор ингредиентов, "
             "обучение и полный запуск. Это не франшиза с пакетами и скрытыми платежами — вы платите за конкретное оборудование и сервис. "
             "Отдельно обычно учитываются только вещи, зависящие от вашей ситуации, например аренда локации или электричество. "
             "Дальше логично либо посмотреть окупаемость, либо обсудить вашу будущую локацию."
@@ -287,6 +268,7 @@ def reply_menu(lang: str) -> ReplyKeyboardMarkup:
         keyboard=keyboard,
         resize_keyboard=True,
         one_time_keyboard=True,
+        is_persistent=True,  # PATCH 1: сохраняем возможность вызвать клавиатуру снова через "квадратик"
         input_field_placeholder={
             "UA": "Напишіть питання…",
             "RU": "Напишите вопрос…",
@@ -364,69 +346,6 @@ def _draft_instructions(lang: str) -> str:
 
 
 # =========================
-# KB-only gate (File Search tool-call check)
-# =========================
-def kb_missing_message(lang: str) -> str:
-    if lang == "EN":
-        return (
-            "Good question. I don’t want to guess here. "
-            "Please choose a menu item or rephrase with 1–2 concrete details (city/area + location type)."
-        )
-    if lang == "FR":
-        return (
-            "Bonne question. Je ne veux pas deviner. "
-            "Choisissez un пункт du menu ou уточните 1–2 détails (ville/quartier + type d’emplacement)."
-        )
-    if lang == "UA":
-        return (
-            "Хороший запит. Я не хочу відповідати навмання. "
-            "Оберіть пункт меню або уточніть 1–2 деталі (місто/район + тип локації)."
-        )
-    return (
-        "Хороший вопрос. Я не хочу отвечать наобум. "
-        "Выберите пункт меню или уточните 1–2 детали (город/район + тип локации)."
-    )
-
-
-async def run_used_file_search(thread_id: str, run_id: str) -> bool:
-    """
-    True only if Assistants run actually executed File Search tool-call.
-    This is the compliance gate: no tool-call -> no answer from assistant.
-    """
-    try:
-        steps = await asyncio.to_thread(
-            client.beta.threads.runs.steps.list,
-            thread_id=thread_id,
-            run_id=run_id,
-            limit=100,
-        )
-        for s in getattr(steps, "data", []) or []:
-            if getattr(s, "type", "") != "tool_calls":
-                continue
-            details = getattr(s, "step_details", None)
-            tool_calls = getattr(details, "tool_calls", None) if details else None
-            if not tool_calls:
-                continue
-            for tc in tool_calls:
-                # Common variants across SDK versions:
-                # - tc.type == "file_search"
-                # - tc.type == "retrieval" (older)
-                # - tc.function.name == "file_search" (function-style)
-                tc_type = (getattr(tc, "type", "") or "").lower()
-                if tc_type in ("file_search", "retrieval"):
-                    return True
-                fn = getattr(tc, "function", None)
-                fn_name = (getattr(fn, "name", "") or "").lower() if fn else ""
-                if fn_name == "file_search":
-                    return True
-        return False
-    except Exception as e:
-        # If we cannot verify steps, we treat it as NOT used (fail-closed)
-        log.warning("KB gate: failed to read run steps (%s) -> fail-closed (no answer).", e)
-        return False
-
-
-# =========================
 # Deterministic calculator (margin + expenses)
 # =========================
 def _extract_cups_per_day(text: str) -> Optional[int]:
@@ -459,6 +378,7 @@ def calc_profit_message(lang: str, cups_per_day: int) -> str:
     net_low = gross - 600
     net_high = gross - 450
 
+    # Keep Max-style opening
     if lang == "EN":
         return (
             "Good question — let’s put numbers on it. "
@@ -472,7 +392,7 @@ def calc_profit_message(lang: str, cups_per_day: int) -> str:
             "Bonne question — mettons des chiffres dessus. "
             f"Avec environ {cups_per_day} tasses/jour et une marge moyenne de 1,8 € par tasse, "
             f"la marge brute est d’environ {gross:,.0f} € par mois. "
-            f"Avec des coûts mensuels typiques de 450–600 €, le résultat net est d’environ {net_low:,.0f}–{net_high:,.0f} € par mois. "
+            f"Avec des coûts mensuels типiques de 450–600 €, le résultat net est d’environ {net_low:,.0f}–{net_high:,.0f} € par mois. "
             "Dites-moi la ville/quartier et le type d’emplacement — et on valide l’hypothèse de trafic."
         )
     if lang == "UA":
@@ -483,6 +403,7 @@ def calc_profit_message(lang: str, cups_per_day: int) -> str:
             f"За типових витрат 450–600 € на місяць чистий результат — орієнтовно {net_low:,.0f}–{net_high:,.0f} € на місяць. "
             "Скажіть місто/район і тип локації — допоможу тверезо звірити очікування по трафіку."
         )
+    # RU
     return (
         "Хороший вопрос — давайте по цифрам. "
         f"При объёме примерно {cups_per_day} чашек в день и средней марже 1,8 € с чашки "
@@ -520,11 +441,28 @@ def _has_disallowed_numbers(text: str) -> bool:
     return bool(re.search(r"\d", tmp))
 
 
-async def _assistant_draft(user_id: str, user_text: str, lang: str) -> Tuple[str, bool]:
+# =========================
+# PATCH 2: KB-only gate helpers
+# =========================
+def _run_used_file_search(steps) -> bool:
     """
-    Returns (draft_text, used_file_search).
-    KB-only gate is enforced by caller (fail-closed).
+    Returns True if run steps contain tool_calls with type == 'file_search'.
+    Compatible with Assistants API steps schema.
     """
+    try:
+        for st in getattr(steps, "data", []) or []:
+            details = getattr(st, "step_details", None)
+            # Typical: step_details.type == "tool_calls"
+            if details and getattr(details, "type", "") == "tool_calls":
+                tcs = getattr(details, "tool_calls", []) or []
+                for tc in tcs:
+                    if getattr(tc, "type", "") == "file_search":
+                        return True
+    except Exception:
+        return False
+    return False
+
+async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
     user = get_user(user_id)
     thread_id = await ensure_thread(user)
 
@@ -551,11 +489,29 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str) -> Tuple[str
         await asyncio.sleep(0.7)
 
     if getattr(run, "status", "") != "completed":
-        return (kb_missing_message(lang), False)
+        # safe fallback
+        return GOLD_5["RU"]["what"] if lang == "RU" else {
+            "UA": "Хороший запит. Щоб відповісти точно: підкажіть місто/район і тип локації.",
+            "EN": "Good question. To answer precisely: what city/area and what location type?",
+            "FR": "Bonne question. Pour répondre précisément : quelle ville/quartier et quel type d’emplacement ?",
+        }.get(lang, "Хороший вопрос. Уточните город/район и тип локации.")
 
-    used_kb = await run_used_file_search(thread_id=thread_id, run_id=run.id)
+    # =========================
+    # PATCH 2: KB-only gate (File Search must be used)
+    # =========================
+    try:
+        steps = await asyncio.to_thread(
+            client.beta.threads.runs.steps.list,
+            thread_id=thread_id,
+            run_id=run.id,
+            limit=50,
+        )
+        if not _run_used_file_search(steps):
+            return "__KB_MISSING__"
+    except Exception as e:
+        log.warning("KB gate: steps.list failed (%s). Treat as KB missing.", e)
+        return "__KB_MISSING__"
 
-    # We still read the assistant text (for logging / debug), but we will only USE it when used_kb=True.
     msgs = await asyncio.to_thread(client.beta.threads.messages.list, thread_id=thread_id, limit=10)
     for m in msgs.data:
         if m.role == "assistant":
@@ -564,9 +520,8 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str) -> Tuple[str
                 if getattr(c, "type", None) == "text":
                     parts.append(c.text.value)
             ans = "\n".join(parts).strip()
-            return (ans or kb_missing_message(lang), used_kb)
-
-    return (kb_missing_message(lang), used_kb)
+            return ans or "Хорошо. Уточните, пожалуйста, пару деталей — и продолжим."
+    return "Хорошо. Уточните, пожалуйста, пару деталей — и продолжим."
 
 
 async def _verify_and_fix(question: str, draft: str, lang: str) -> str:
@@ -614,12 +569,28 @@ Hard rules:
 
 def _final_safety_override(question: str, answer: str, lang: str) -> str:
     if not answer:
-        return kb_missing_message(lang)
+        return GOLD_5["RU"]["what"] if lang == "RU" else "Хороший вопрос. Уточните пару деталей — и продолжим."
 
     if looks_like_legacy_franchise(answer) or _has_disallowed_numbers(answer):
-        return kb_missing_message(lang)
-
+        # fallback to safest: ask 1 clarification
+        if lang == "EN":
+            return "Good question. To answer precisely, tell me the city/area and the location type."
+        if lang == "FR":
+            return "Bonne question. Pour répondre précisément, dites-moi la ville/quartier et le type d’emplacement."
+        if lang == "UA":
+            return "Хороший запит. Щоб відповісти точно, підкажіть місто/район і тип локації."
+        return "Хороший вопрос. Чтобы ответить точно, скажите город/район и тип локации."
     return answer
+
+
+def _kb_missing_reply(lang: str) -> str:
+    if lang == "EN":
+        return "I can’t answer this correctly from the knowledge base. Please choose a menu item or уточните вопрос."
+    if lang == "FR":
+        return "Je ne peux pas répondre correctement à partir de la base. Choisissez un пункт du menu ou уточните вопрос."
+    if lang == "UA":
+        return "Я не можу відповісти коректно з бази. Оберіть пункт меню або уточніть запит."
+    return "Я не могу ответить корректно по базе. Выберите пункт меню или уточните вопрос."
 
 
 async def ask_assistant(user_id: str, user_text: str, lang: str) -> str:
@@ -628,15 +599,16 @@ async def ask_assistant(user_id: str, user_text: str, lang: str) -> str:
     if cups is not None:
         return calc_profit_message(lang=lang, cups_per_day=cups)
 
-    # 1) KB draft
-    draft, used_kb = await _assistant_draft(user_id=user_id, user_text=user_text, lang=lang)
+    # 1) KB draft (with KB-only gate)
+    draft = await _assistant_draft(user_id=user_id, user_text=user_text, lang=lang)
 
-    # KB-only gate: if File Search was NOT used, do NOT answer with draft.
-    if not used_kb:
-        return kb_missing_message(lang)
+    # KB gate: if File Search wasn't used => NO ANSWER
+    if draft == "__KB_MISSING__":
+        return _kb_missing_reply(lang)
 
     # 2) verify/rewrite
     fixed = await _verify_and_fix(question=user_text, draft=draft, lang=lang)
+
     # 3) final guard
     return _final_safety_override(question=user_text, answer=fixed, lang=lang)
 
@@ -668,7 +640,6 @@ def match_menu_action(lang: str, text: str) -> Optional[str]:
         if t == L[key]:
             return key
     return None
-
 
 # =========================
 # COMMANDS / HANDLERS
@@ -769,10 +740,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if action in ("what", "price", "payback", "terms", "contacts"):
-            # GOLD responses for buttons (RU fixed эталон)
+            # GOLD responses for buttons
             if u.lang == "RU":
                 await update.message.reply_text(GOLD_5["RU"][action])
             else:
+                # for non-RU, use assistant pipeline (still safe) but keep Max-start phrasing via verifier.
                 stop = asyncio.Event()
                 typing_task = asyncio.create_task(_typing_loop(context, update.effective_chat.id, stop))
                 try:
@@ -783,7 +755,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(ans)
             return
 
-        # 2) Free text -> assistant pipeline (KB-only gated)
+        # 2) Free text -> assistant pipeline
         stop = asyncio.Event()
         typing_task = asyncio.create_task(_typing_loop(context, update.effective_chat.id, stop))
         try:
@@ -792,7 +764,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             stop.set()
             await typing_task
 
-        # IMPORTANT: do NOT attach reply keyboard here
+        # IMPORTANT: do NOT attach reply keyboard here (so it doesn't feel like "buttons after every answer")
         await update.message.reply_text(ans)
 
 
