@@ -16,6 +16,7 @@ from telegram import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    ReplyKeyboardRemove,   # <<< PATCH: for correct “square” behavior
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -206,7 +207,7 @@ CONTACTS_TEXT = {
     "FR": "Contacts Maison de Café:\n• Email : maisondecafe.coffee@gmail.com\n• Téléphone : +32 470 600 806\n• Telegram : https://t.me/maisondecafe",
 }
 
-# GOLD answers (5 эталонов) — максимально близко к твоей формулировке.
+# GOLD answers (5 эталонов)
 GOLD_5 = {
     "RU": {
         "what": (
@@ -219,7 +220,7 @@ GOLD_5 = {
         "price": (
             "Хороший вопрос, давайте детально разберем. "
             "Базовая стоимость запуска точки Maison de Café в Бельгии составляет 9 800 €. "
-            "В эту сумму входит профессиональный кофейный автомат Jetinno JL-300, фирменная стойка, телеметрия, стартовый набор ингредиентов, "
+            "В эту сумму входит профессиональный автомат Jetinno JL-300, фирменная стойка, телеметрия, стартовый набор ингредиентов, "
             "обучение и полный запуск. Это не франшиза с пакетами и скрытыми платежами — вы платите за конкретное оборудование и сервис. "
             "Отдельно обычно учитываются только вещи, зависящие от вашей ситуации, например аренда локации или электричество. "
             "Дальше логично либо посмотреть окупаемость, либо обсудить вашу будущую локацию."
@@ -248,10 +249,6 @@ GOLD_5 = {
     }
 }
 
-def gold_lang(lang: str) -> str:
-    return lang if lang in LANGS else "RU"
-
-
 def reply_menu(lang: str) -> ReplyKeyboardMarkup:
     L = MENU_LABELS.get(lang, MENU_LABELS["RU"])
     keyboard = [
@@ -266,7 +263,7 @@ def reply_menu(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        one_time_keyboard=False,  # ВАЖНО: так iOS показывает "квадратик"
+        one_time_keyboard=True,
         input_field_placeholder={
             "UA": "Напишіть питання…",
             "RU": "Напишите вопрос…",
@@ -274,7 +271,6 @@ def reply_menu(lang: str) -> ReplyKeyboardMarkup:
             "FR": "Écrivez votre question…",
         }.get(lang, "Напишите вопрос…"),
     )
-
 
 def lang_inline_keyboard() -> InlineKeyboardMarkup:
     kb = [
@@ -313,12 +309,21 @@ async def ensure_thread(user: UserState) -> str:
     return thread.id
 
 
-def _draft_instructions(lang: str) -> str:
+def _draft_instructions(lang: str, force_file_search: bool = False) -> str:
+    # <<< PATCH: force_file_search mode (2nd attempt)
+    force = ""
+    if force_file_search:
+        force = (
+            "ВАЖНО: перед тем как отвечать, ОБЯЗАТЕЛЬНО используй инструмент file_search минимум один раз. "
+            "Если в базе нет ответа — прямо скажи, что не можешь ответить корректно по базе, и попроси уточнение/выбор пункта меню. "
+        )
+
     if lang == "UA":
         return (
             "Ти — Max, консультант Maison de Café. Відповідай по-людськи, спокійно, впевнено. "
             "Не згадуй бази знань/файли/пошук. "
             "НЕ вигадуй цифри, пакети, роялті, паушальні внески або формати «класичної франшизи». "
+            f"{force}"
             "Якщо для точної відповіді бракує даних — поясни це просто і задай 1 коротке уточнення."
         )
     if lang == "EN":
@@ -326,6 +331,7 @@ def _draft_instructions(lang: str) -> str:
             "You are Max, a Maison de Café consultant. Speak naturally and confidently. "
             "Do not mention knowledge bases/files/search. "
             "Do NOT invent numbers, packages, royalties, franchise fees, or generic coffee-shop templates. "
+            f"{force}"
             "If details are needed, explain simply and ask 1 short clarifying question."
         )
     if lang == "FR":
@@ -333,12 +339,14 @@ def _draft_instructions(lang: str) -> str:
             "Tu es Max, consultant Maison de Café. Réponds de façon humaine et sûre. "
             "Ne mentionne pas de base de connaissances/fichiers/recherche. "
             "N’invente pas de chiffres, de packs, de royalties ou de « franchise classique ». "
+            f"{force}"
             "Si des détails manquent, explique simplement et pose 1 question courte."
         )
     return (
         "Ты — Max, консультант Maison de Café. Отвечай по-человечески, спокойно, уверенно. "
         "Не упоминай базы знаний/файлы/поиск. "
         "НЕ придумывай цифры, пакеты, роялти, паушальные взносы или шаблоны «классической франшизы». "
+        f"{force}"
         "Если для точного ответа не хватает данных — объясни это просто и задай 1 короткий уточняющий вопрос."
     )
 
@@ -347,17 +355,12 @@ def _draft_instructions(lang: str) -> str:
 # Deterministic calculator (margin + expenses)
 # =========================
 def _extract_cups_per_day(text: str) -> Optional[int]:
-    """
-    Extract cups/day from user message. Accepts up to 200.
-    Triggers on context words (чаш/ cups / cups a day).
-    """
     t = (text or "").lower()
     if not any(w in t for w in ["чаш", "cup", "cups", "cups/day", "чашек", "порций"]):
         return None
     nums = re.findall(r"\b(\d{1,3})\b", t)
     if not nums:
         return None
-    # Heuristic: take first number <=200
     for n in nums:
         v = int(n)
         if 1 <= v <= 200:
@@ -366,101 +369,93 @@ def _extract_cups_per_day(text: str) -> Optional[int]:
 
 
 def calc_profit_message(lang: str, cups_per_day: int) -> str:
-    """
-    Uses: margin 1.8 €/cup, 30 days/month, expenses 450–600 €/month.
-    Returns gross margin & net range.
-    """
     margin_per_cup = 1.8
     days = 30
     gross = cups_per_day * days * margin_per_cup
     net_low = gross - 600
     net_high = gross - 450
 
-    # Keep Max-style opening
     if lang == "EN":
         return (
             "Good question — let’s put numbers on it. "
             f"With about {cups_per_day} cups/day and an average margin of 1.8 € per cup, "
             f"the gross margin is roughly {gross:,.0f} € per month. "
-            f"With typical monthly costs of 450–600 €, the net result is about {net_low:,.0f}–{net_high:,.0f} € per month. "
-            "If you tell me the city/area and the location type, I’ll help you sanity-check the traffic assumptions."
+            f"With typical monthly costs of 450–600 €, the net result is about {net_low:,.0f}–{net_high:,.0f} € per month."
         )
     if lang == "FR":
         return (
             "Bonne question — mettons des chiffres dessus. "
             f"Avec environ {cups_per_day} tasses/jour et une marge moyenne de 1,8 € par tasse, "
             f"la marge brute est d’environ {gross:,.0f} € par mois. "
-            f"Avec des coûts mensuels типiques de 450–600 €, le résultat net est d’environ {net_low:,.0f}–{net_high:,.0f} € par mois. "
-            "Dites-moi la ville/quartier et le type d’emplacement — et on valide l’hypothèse de trafic."
+            f"Avec des coûts mensuels typiques de 450–600 €, le résultat net est d’environ {net_low:,.0f}–{net_high:,.0f} € par mois."
         )
     if lang == "UA":
         return (
             "Хороший запит — давайте по цифрах. "
             f"За обсягу приблизно {cups_per_day} чашок/день і середньої маржі 1,8 € з чашки, "
             f"валова маржа виходить близько {gross:,.0f} € на місяць. "
-            f"За типових витрат 450–600 € на місяць чистий результат — орієнтовно {net_low:,.0f}–{net_high:,.0f} € на місяць. "
-            "Скажіть місто/район і тип локації — допоможу тверезо звірити очікування по трафіку."
+            f"За типових витрат 450–600 € на місяць чистий результат — орієнтовно {net_low:,.0f}–{net_high:,.0f} € на місяць."
         )
-    # RU
     return (
         "Хороший вопрос — давайте по цифрам. "
         f"При объёме примерно {cups_per_day} чашек в день и средней марже 1,8 € с чашки "
         f"валовая маржа выходит около {gross:,.0f} € в месяц. "
-        f"При типичных ежемесячных расходах 450–600 € чистый результат — ориентировочно {net_low:,.0f}–{net_high:,.0f} € в месяц. "
-        "Скажи город/район и тип локации — помогу трезво сверить ожидания по трафику."
+        f"При типичных ежемесячных расходах 450–600 € чистый результат — ориентировочно {net_low:,.0f}–{net_high:,.0f} € в месяц."
     )
 
 
 # =========================
-# ANSWER PIPELINE (2-PASS): DRAFT -> VERIFY -> SEND
+# KB-ONLY GATE helpers (PATCH)
 # =========================
-_ALLOWED_NUMBER_PATTERNS = [
-    r"\b9\s*800\b",
-    r"\b9800\b",
-    r"\b1[\.,]8\b",
-    r"\b35\b",
-    r"\b1\s*900\b",
-    r"\b1200\b",
-    r"\b1\s*200\b",
-    r"\b1300\b",
-    r"\b1\s*300\b",
-    r"\b9\s*[–-]\s*12\b",
-    r"\b450\b",
-    r"\b600\b",
-    r"\b200\b",
-]
+def _kb_only_fallback(lang: str) -> str:
+    if lang == "EN":
+        return "I can’t answer correctly from the knowledge base. Please choose a menu item or уточните вопрос."
+    if lang == "FR":
+        return "Je ne peux pas répondre correctement selon la base. Choisissez un пункт du menu ou уточните вопрос."
+    if lang == "UA":
+        return "Я не можу відповісти коректно по базі. Оберіть пункт меню або уточніть питання."
+    return "Я не могу ответить корректно по базе. Выберите пункт меню или уточните вопрос."
 
-def _has_disallowed_numbers(text: str) -> bool:
-    if not text:
-        return False
-    tmp = text
-    for p in _ALLOWED_NUMBER_PATTERNS:
-        tmp = re.sub(p, "", tmp)
-    return bool(re.search(r"\d", tmp))
-
-
-# =========================
-# PATCH 2: KB-only gate helpers
-# =========================
-def _run_used_file_search(steps) -> bool:
+async def _run_used_file_search(thread_id: str, run_id: str) -> bool:
     """
-    Returns True if run steps contain tool_calls with type == 'file_search'.
-    Compatible with Assistants API steps schema.
+    Returns True if any run step contains a tool call of type 'file_search'.
     """
     try:
+        steps = await asyncio.to_thread(
+            client.beta.threads.runs.steps.list,
+            thread_id=thread_id,
+            run_id=run_id,
+            limit=50,
+        )
         for st in getattr(steps, "data", []) or []:
             details = getattr(st, "step_details", None)
-            # Typical: step_details.type == "tool_calls"
-            if details and getattr(details, "type", "") == "tool_calls":
-                tcs = getattr(details, "tool_calls", []) or []
-                for tc in tcs:
-                    if getattr(tc, "type", "") == "file_search":
+            if not details:
+                continue
+            # SDK objects may vary; we check robustly
+            # Common shape: details.type == "tool_calls" and details.tool_calls[*].type == "file_search"
+            d_type = getattr(details, "type", None) or getattr(details, "kind", None)
+            if d_type == "tool_calls":
+                tool_calls = getattr(details, "tool_calls", None) or []
+                for tc in tool_calls:
+                    tc_type = getattr(tc, "type", None) or getattr(tc, "tool", None)
+                    if tc_type == "file_search":
                         return True
-    except Exception:
+                    # Sometimes nested: tc.file_search exists
+                    if getattr(tc, "file_search", None) is not None:
+                        return True
         return False
-    return False
+    except Exception as e:
+        log.warning("steps.list failed: %s", e)
+        return False
 
-async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
+
+# =========================
+# ANSWER PIPELINE (Assistant draft + KB-only gate)
+# =========================
+async def _assistant_draft(user_id: str, user_text: str, lang: str, force_file_search: bool) -> Tuple[str, bool]:
+    """
+    Returns (answer_text, file_search_used)
+    """
     user = get_user(user_id)
     thread_id = await ensure_thread(user)
 
@@ -475,7 +470,7 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
         client.beta.threads.runs.create,
         thread_id=thread_id,
         assistant_id=ASSISTANT_ID,
-        instructions=_draft_instructions(lang),
+        instructions=_draft_instructions(lang, force_file_search=force_file_search),
     )
 
     deadline = time.time() + 45
@@ -487,28 +482,9 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
         await asyncio.sleep(0.7)
 
     if getattr(run, "status", "") != "completed":
-        # safe fallback
-        return GOLD_5["RU"]["what"] if lang == "RU" else {
-            "UA": "Хороший запит. Щоб відповісти точно: підкажіть місто/район і тип локації.",
-            "EN": "Good question. To answer precisely: what city/area and what location type?",
-            "FR": "Bonne question. Pour répondre précisément : quelle ville/quartier et quel type d’emplacement ?",
-        }.get(lang, "Хороший вопрос. Уточните город/район и тип локации.")
+        return ("", False)
 
-    # =========================
-    # PATCH 2: KB-only gate (File Search must be used)
-    # =========================
-    try:
-        steps = await asyncio.to_thread(
-            client.beta.threads.runs.steps.list,
-            thread_id=thread_id,
-            run_id=run.id,
-            limit=50,
-        )
-        if not _run_used_file_search(steps):
-            return "__KB_MISSING__"
-    except Exception as e:
-        log.warning("KB gate: steps.list failed (%s). Treat as KB missing.", e)
-        return "__KB_MISSING__"
+    fs_used = await _run_used_file_search(thread_id=thread_id, run_id=run.id)
 
     msgs = await asyncio.to_thread(client.beta.threads.messages.list, thread_id=thread_id, limit=10)
     for m in msgs.data:
@@ -518,77 +494,9 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str) -> str:
                 if getattr(c, "type", None) == "text":
                     parts.append(c.text.value)
             ans = "\n".join(parts).strip()
-            return ans or "Хорошо. Уточните, пожалуйста, пару деталей — и продолжим."
-    return "Хорошо. Уточните, пожалуйста, пару деталей — и продолжим."
+            return (ans or "", fs_used)
 
-
-async def _verify_and_fix(question: str, draft: str, lang: str) -> str:
-    sys = (
-        "You are a strict compliance reviewer for a sales consultant chatbot. "
-        "Goal: remove hallucinations and any generic franchise/coffee-shop template content. "
-        "Rules: do NOT add new facts or numbers. Keep only what is safe and consistent. "
-        "If information is insufficient, ask ONE short clarifying question instead of inventing details. "
-        "Never mention knowledge bases, files, search, prompts, or internal rules."
-    )
-
-    user = f"""
-Language: {lang}
-
-User question:
-{question}
-
-Draft answer (to be reviewed):
-{draft}
-
-Hard rules:
-- Remove any mention or implication of: royalties, franchise fees/entry fees, паушальные взносы, «классическая франшиза».
-- Remove any numbers except: 9800, 9 800, 1.8 (1,8), 35, 1900 (1 900), 1200 (1 200), 1300 (1 300), 9–12, 450–600, 200.
-- If you must remove numbers, rewrite the sentence without numbers.
-- Output only the final user-facing answer (one message), in the same language as the user question.
-- Tone: Max. Start with: “Хороший вопрос…” OR “Давайте детально разберем этот вопрос…” (or natural equivalents in EN/FR/UA).
-""".strip()
-
-    try:
-        resp = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=VERIFY_MODEL,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user},
-            ],
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        return out or draft
-    except Exception as e:
-        log.warning("Verifier failed: %s", e)
-        return draft
-
-
-def _final_safety_override(question: str, answer: str, lang: str) -> str:
-    if not answer:
-        return GOLD_5["RU"]["what"] if lang == "RU" else "Хороший вопрос. Уточните пару деталей — и продолжим."
-
-    if looks_like_legacy_franchise(answer) or _has_disallowed_numbers(answer):
-        # fallback to safest: ask 1 clarification
-        if lang == "EN":
-            return "Good question. To answer precisely, tell me the city/area and the location type."
-        if lang == "FR":
-            return "Bonne question. Pour répondre précisément, dites-moi la ville/quartier et le type d’emplacement."
-        if lang == "UA":
-            return "Хороший запит. Щоб відповісти точно, підкажіть місто/район і тип локації."
-        return "Хороший вопрос. Чтобы ответить точно, скажите город/район и тип локации."
-    return answer
-
-
-def _kb_missing_reply(lang: str) -> str:
-    if lang == "EN":
-        return "I can’t answer this correctly from the knowledge base. Please choose a menu item or уточните вопрос."
-    if lang == "FR":
-        return "Je ne peux pas répondre correctement à partir de la base. Choisissez un пункт du menu ou уточните вопрос."
-    if lang == "UA":
-        return "Я не можу відповісти коректно з бази. Оберіть пункт меню або уточніть запит."
-    return "Я не могу ответить корректно по базе. Выберите пункт меню или уточните вопрос."
+    return ("", fs_used)
 
 
 async def ask_assistant(user_id: str, user_text: str, lang: str) -> str:
@@ -597,19 +505,18 @@ async def ask_assistant(user_id: str, user_text: str, lang: str) -> str:
     if cups is not None:
         return calc_profit_message(lang=lang, cups_per_day=cups)
 
-    # 1) KB draft (with KB-only gate)
-    draft = await _assistant_draft(user_id=user_id, user_text=user_text, lang=lang)
+    # 1) Run #1 (normal)
+    ans1, fs1 = await _assistant_draft(user_id=user_id, user_text=user_text, lang=lang, force_file_search=False)
+    if fs1 and ans1:
+        return ans1
 
-    # KB gate: if File Search wasn't used => NO ANSWER
-    if draft == "__KB_MISSING__":
-        return _kb_missing_reply(lang)
+    # 2) Run #2 (FORCE file_search)
+    ans2, fs2 = await _assistant_draft(user_id=user_id, user_text=user_text, lang=lang, force_file_search=True)
+    if fs2 and ans2:
+        return ans2
 
-    # 2) verify/rewrite
-    fixed = await _verify_and_fix(question=user_text, draft=draft, lang=lang)
-
-    # 3) final guard
-    return _final_safety_override(question=user_text, answer=fixed, lang=lang)
-
+    # 3) Hard fallback (KB-only rule)
+    return _kb_only_fallback(lang)
 
 # =========================
 # Typing indicator helper
@@ -627,9 +534,6 @@ async def _typing_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, stop_ev
 # Button text routing
 # =========================
 def match_menu_action(lang: str, text: str) -> Optional[str]:
-    """
-    Returns one of: what/price/payback/terms/contacts/presentation/lang
-    """
     if not text:
         return None
     t = text.strip()
@@ -652,7 +556,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "EN": "Hi! I’m Max, Maison de Café consultant. Choose a menu item and I’ll guide you.",
         "FR": "Bonjour ! Je suis Max, consultant Maison de Café. Choisissez un пункт du menu et je vous guide.",
     }.get(u.lang, "Привет! Я Max.")
-    # IMPORTANT: keyboard appears only here (and after language change)
     await update.message.reply_text(hello, reply_markup=reply_menu(u.lang))
 
 
@@ -684,7 +587,7 @@ async def on_lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     confirm = {"UA": "Мову змінено.", "RU": "Язык изменён.", "EN": "Language updated.", "FR": "Langue mise à jour."}.get(u.lang, "OK")
 
-    # IMPORTANT: show reply keyboard again after language change (per your requirement)
+    # show reply keyboard again after language change
     await q.message.reply_text(confirm, reply_markup=reply_menu(u.lang))
 
 
@@ -696,11 +599,12 @@ async def send_presentation(chat_id: int, lang: str, context: ContextTypes.DEFAU
             "EN": "Good question. The presentation isn’t connected yet — once the file is added, I can send it right away.",
             "FR": "Bonne question. La présentation n’est pas encore connectée — dès que le fichier est ajouté, je peux l’envoyer.",
         }.get(lang, "Презентация ещё не подключена.")
-        await context.bot.send_message(chat_id=chat_id, text=msg)
+        await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=ReplyKeyboardRemove())  # <<< PATCH
         return
 
     try:
         await context.bot.send_document(chat_id=chat_id, document=PRESENTATION_FILE_ID)
+        await context.bot.send_message(chat_id=chat_id, text=" ", reply_markup=ReplyKeyboardRemove())  # <<< PATCH: hide kb after doc
     except Exception as e:
         log.warning("Presentation send failed: %s", e)
         msg = {
@@ -709,7 +613,7 @@ async def send_presentation(chat_id: int, lang: str, context: ContextTypes.DEFAU
             "EN": "Good question. I couldn’t send the presentation here. Message me and I’ll share it another way.",
             "FR": "Bonne question. Je n’arrive pas à envoyer la présentation ici. Écrivez-moi et je la partagerai autrement.",
         }.get(lang, "Не получилось отправить презентацию.")
-        await context.bot.send_message(chat_id=chat_id, text=msg)
+        await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=ReplyKeyboardRemove())  # <<< PATCH
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -722,13 +626,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
 
-    # Per-user lock to avoid double answers/races
     async with get_user_lock(user_id):
-        # 1) If pressed one of 7 reply buttons
         action = match_menu_action(u.lang, text)
 
         if action == "lang":
-            # Inline language picker only
             prompt = {"UA": "Оберіть мову:", "RU": "Выберите язык:", "EN": "Choose language:", "FR": "Choisissez la langue:"}.get(u.lang, "Выберите язык:")
             await update.message.reply_text(prompt, reply_markup=lang_inline_keyboard())
             return
@@ -738,11 +639,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if action in ("what", "price", "payback", "terms", "contacts"):
-            # GOLD responses for buttons
             if u.lang == "RU":
-                await update.message.reply_text(GOLD_5["RU"][action])
+                await update.message.reply_text(GOLD_5["RU"][action], reply_markup=ReplyKeyboardRemove())  # <<< PATCH
             else:
-                # for non-RU, use assistant pipeline (still safe) but keep Max-start phrasing via verifier.
                 stop = asyncio.Event()
                 typing_task = asyncio.create_task(_typing_loop(context, update.effective_chat.id, stop))
                 try:
@@ -750,10 +649,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 finally:
                     stop.set()
                     await typing_task
-                await update.message.reply_text(ans)
+                await update.message.reply_text(ans, reply_markup=ReplyKeyboardRemove())  # <<< PATCH
             return
 
-        # 2) Free text -> assistant pipeline
+        # Free text -> KB-only gate pipeline
         stop = asyncio.Event()
         typing_task = asyncio.create_task(_typing_loop(context, update.effective_chat.id, stop))
         try:
@@ -762,8 +661,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             stop.set()
             await typing_task
 
-        # IMPORTANT: do NOT attach reply keyboard here (so it doesn't feel like "buttons after every answer")
-        await update.message.reply_text(ans)
+        await update.message.reply_text(ans, reply_markup=ReplyKeyboardRemove())  # <<< PATCH
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -784,7 +682,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ogg_path = f"/tmp/voice_{user_id}_{int(time.time())}.ogg"
             await tg_file.download_to_drive(ogg_path)
 
-            # Transcribe
             with open(ogg_path, "rb") as f:
                 tr = await asyncio.to_thread(
                     client.audio.transcriptions.create,
@@ -800,17 +697,16 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     "EN": "Good question. I couldn’t transcribe the voice message. Please try again, shorter and clearer.",
                     "FR": "Bonne question. Je n’ai pas pu transcrire le message vocal. Réessayez plus court et plus clair.",
                 }.get(u.lang, "Не смог распознать голос.")
-                await update.message.reply_text(msg)
+                await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())  # <<< PATCH
                 return
 
             ans = await ask_assistant(user_id=user_id, user_text=transcript, lang=u.lang)
-            await update.message.reply_text(ans)
+            await update.message.reply_text(ans, reply_markup=ReplyKeyboardRemove())  # <<< PATCH
         finally:
             stop.set()
             await typing_task
 
 
-# Polling anti-conflict: clear webhook + drop pending updates
 async def post_init(app: Application) -> None:
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -832,13 +728,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Inline callbacks only for language picker
     app.add_handler(CallbackQueryHandler(on_lang_callback, pattern=r"^LANG:"))
 
-    # Voice
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
-
-    # Text (non-commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
