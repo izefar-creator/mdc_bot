@@ -83,9 +83,21 @@ class Config:
     VERIFIER_MODEL: str
 
 def load_config() -> Config:
-    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    def get_env(name: str):
+        v = os.getenv(name)
+        return v.strip() if v and v.strip() else None
+
+    token = (
+        get_env("TELEGRAM_TOKEN")
+        or get_env("TELEGRAM_BOT_TOKEN")
+        or get_env("BOT_TOKEN")
+    )
+
     if not token:
-        raise RuntimeError("Missing TELEGRAM_TOKEN")
+        raise RuntimeError(
+            "Missing Telegram token. Checked: TELEGRAM_TOKEN, TELEGRAM_BOT_TOKEN, BOT_TOKEN"
+        )
+
 
     cfg = Config(
         TELEGRAM_TOKEN=token,
