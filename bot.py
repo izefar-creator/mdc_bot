@@ -254,7 +254,6 @@ def gold_lang(lang: str) -> str:
 
 def reply_menu(lang: str) -> ReplyKeyboardMarkup:
     L = MENU_LABELS.get(lang, MENU_LABELS["RU"])
-    # 7 кнопок, one_time_keyboard=True => после нажатия/сообщения скрывается, появляется системный "квадратик"
     keyboard = [
         [KeyboardButton(L["what"])],
         [KeyboardButton(L["price"])],
@@ -267,8 +266,7 @@ def reply_menu(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
-        one_time_keyboard=True,
-        is_persistent=True,  # PATCH 1: сохраняем возможность вызвать клавиатуру снова через "квадратик"
+        one_time_keyboard=False,  # ВАЖНО: так iOS показывает "квадратик"
         input_field_placeholder={
             "UA": "Напишіть питання…",
             "RU": "Напишите вопрос…",
