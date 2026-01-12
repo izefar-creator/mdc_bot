@@ -503,16 +503,16 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str, force_file_s
 
     t = text
 
-    # 1) Типовые "цитаты" File Search (как на скринах): [22:0†Maison_de_Cafe_....docx]
-    t = re.sub(r"\[\s*\d+\s*:\s*\d+\s*†[^\]]+\]", "", t)
+    # 1) Типовые "цитаты" File Search (как на скринах): [22:0†Maison_de_Cafe_...docx]
+    t = re.sub(r"\[\s*\d+\s*:\s*\d+\s*\+[^\]]+\]", "", t)
 
     # 2) Варианты с китайскими скобками: 【...】
-    t = re.sub(r"【[^】]+】", "", t)
+    t = re.sub(r"[【】]+", "", t)
 
     # 3) Любые явные упоминания файлов (на всякий)
     t = re.sub(r"\b\S+\.(docx|pdf|txt|pptx|xlsx)\b", "", t, flags=re.IGNORECASE)
 
-    # 4) Убираем "хвосты" лишних пробелов/пустых строк
+    # 4) Убираем хвосты лишних пробелов/пустых строк
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
 
