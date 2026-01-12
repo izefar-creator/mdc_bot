@@ -503,21 +503,20 @@ async def _assistant_draft(user_id: str, user_text: str, lang: str, force_file_s
 
     t = text
 
-    # 1) Типовые "цитаты" File Search (как на скринах): [22:0†Maison_de_Cafe_...docx]
-    t = re.sub(r"\[\s*\d+\s*:\s*\d+\s*\+[^\]]+\]", "", t)
+    # 1) Типовые "цитаты" File Search
+    t = re.sub(r"\[\s*\d+\s*:\s*\d+\s*[^\]]+\]", "", t)
 
-    # 2) Варианты с китайскими скобками: 【...】
-    t = re.sub(r"[【】]+", "", t)
+    # 2) Варианты с квадратными скобками [...]
+    t = re.sub(r"\[[^\]]+\]", "", t)
 
-    # 3) Любые явные упоминания файлов (на всякий)
+    # 3) Явные упоминания файлов
     t = re.sub(r"\b\S+\.(docx|pdf|txt|pptx|xlsx)\b", "", t, flags=re.IGNORECASE)
 
-    # 4) Убираем хвосты лишних пробелов/пустых строк
+    # 4) Хвосты пробелов и пустых строк
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
 
     return t
-
 
 async def ask_assistant(user_id: str, user_text: str, lang: str) -> str:
     # 0) deterministic calculator override
